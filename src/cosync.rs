@@ -18,7 +18,7 @@ use futures::{
     FutureExt, StreamExt,
 };
 
-use super::FuturesUnordered;
+use super::futures::FuturesUnordered;
 
 /// A single-threaded task pool for polling futures to completion.
 ///
