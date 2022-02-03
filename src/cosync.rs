@@ -1,5 +1,6 @@
 use std::{
     collections::VecDeque,
+    future::Future,
     ops,
     pin::Pin,
     ptr::NonNull,
@@ -14,7 +15,7 @@ use std::{
 use futures::{
     executor::enter,
     task::{waker_ref, ArcWake},
-    Future, FutureExt, StreamExt,
+    FutureExt, StreamExt,
 };
 
 use super::FuturesUnordered;

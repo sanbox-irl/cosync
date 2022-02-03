@@ -90,7 +90,11 @@ impl<Fut> Task<Fut> {
     /// `Relaxed` or `Acquire` ordering can be used. `Acquire` ordering must be
     /// used before `len_all` can be safely read.
     #[inline]
-    pub(super) fn spin_next_all(&self, pending_next_all: *mut Self, ordering: Ordering) -> *const Self {
+    pub(super) fn spin_next_all(
+        &self,
+        pending_next_all: *mut Self,
+        ordering: Ordering,
+    ) -> *const Self {
         loop {
             let next = self.next_all.load(ordering);
             if next != pending_next_all {

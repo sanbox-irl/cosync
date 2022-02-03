@@ -1,13 +1,8 @@
-//! An unbounded set of futures.
-//!
-//! This module is only available when the `std` or `alloc` feature of this
-//! library is activated, and it is activated by default.
-
 use futures::{
     stream::{FusedStream, Stream},
-    task::{AtomicWaker, Context, Poll},
+    task::AtomicWaker,
 };
-// use futures_task::{FutureObj, LocalFutureObj, LocalSpawn, Spawn, SpawnError};
+
 use std::{
     cell::UnsafeCell,
     cmp,
@@ -25,6 +20,7 @@ use std::{
         },
         Arc, Weak,
     },
+    task::{Context, Poll},
 };
 
 mod abort;
