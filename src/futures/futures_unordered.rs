@@ -415,10 +415,157 @@ impl<Fut> FuturesUnordered<Fut> {
     }
 }
 
+impl<Fut: Future> FuturesUnordered<Fut> {
+    pub fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Fut::Output>> {
+        // See YIELD_EVERY docs　for more.
+        let yield_every = cmp::min(self.len(), YIELD_EVERY);
+
+        // Keep track of how many child futures we have polled,
+        // in case we want to forcibly yield.
+        let mut polled = 0;
+
+        // Ensure `parent` is correctly set.
+        self.ready_to_run_queue.waker.register(cx.waker());
+
+        loop {
+            // Safety: &mut self guarantees the mutual exclusion `dequeue`
+            // expects
+            let task = match unsafe { self.ready_to_run_queue.dequeue() } {
+                Dequeue::Empty => {
+                    if self.is_empty() {
+                        // We can only consider ourselves terminated once we
+                        // have yielded a `None`
+                        *self.is_terminated.get_mut() = true;
+                        return Poll::Ready(None);
+                    } else {
+                        return Poll::Pending;
+                    }
+                }
+                Dequeue::Inconsistent => {
+                    // At this point, it may be worth yielding the thread &
+                    // spinning a few times... but for now, just yield using the
+                    // task system.
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                Dequeue::Data(task) => task,
+            };
+
+            debug_assert!(task != self.ready_to_run_queue.stub());
+
+            // Safety:
+            // - `task` is a valid pointer.
+            // - We are the only thread that accesses the `UnsafeCell` that contains the future
+            let future = match unsafe { &mut *(*task).future.get() } {
+                Some(future) => future,
+
+                // If the future has already gone away then we're just
+                // cleaning out this task. See the comment in
+                // `release_task` for more information, but we're basically
+                // just taking ownership of our reference count here.
+                None => {
+                    // This case only happens when `release_task` was called
+                    // for this task before and couldn't drop the task
+                    // because it was already enqueued in the ready to run
+                    // queue.
+
+                    // Safety: `task` is a valid pointer
+                    let task = unsafe { Arc::from_raw(task) };
+
+                    // Double check that the call to `release_task` really
+                    // happened. Calling it required the task to be unlinked.
+                    debug_assert_eq!(task.next_all.load(Relaxed), self.pending_next_all());
+                    unsafe {
+                        debug_assert!((*task.prev_all.get()).is_null());
+                    }
+                    continue;
+                }
+            };
+
+            // Safety: `task` is a valid pointer
+            let task = unsafe { self.unlink(task) };
+
+            // Unset queued flag: This must be done before polling to ensure
+            // that the future's task gets rescheduled if it sends a wake-up
+            // notification **during** the call to `poll`.
+            let prev = task.queued.swap(false, SeqCst);
+            assert!(prev);
+
+            // We're going to need to be very careful if the `poll`
+            // method below panics. We need to (a) not leak memory and
+            // (b) ensure that we still don't have any use-after-frees. To
+            // manage this we do a few things:
+            //
+            // * A "bomb" is created which if dropped abnormally will call `release_task`. That way we'll be
+            //   sure the memory management of the `task` is managed correctly. In particular `release_task`
+            //   will drop the future. This ensures that it is dropped on this thread and not accidentally on a
+            //   different thread (bad).
+            // * We unlink the task from our internal queue to preemptively assume it'll panic, in which case
+            //   we'll want to discard it regardless.
+            struct Bomb<'a, Fut> {
+                queue: &'a mut FuturesUnordered<Fut>,
+                task: Option<Arc<Task<Fut>>>,
+            }
+
+            impl<Fut> Drop for Bomb<'_, Fut> {
+                fn drop(&mut self) {
+                    if let Some(task) = self.task.take() {
+                        self.queue.release_task(task);
+                    }
+                }
+            }
+
+            let mut bomb = Bomb {
+                task: Some(task),
+                queue: &mut *self,
+            };
+
+            // Poll the underlying future with the appropriate waker
+            // implementation. This is where a large bit of the unsafety
+            // starts to stem from internally. The waker is basically just
+            // our `Arc<Task<Fut>>` and can schedule the future for polling by
+            // enqueuing itself in the ready to run queue.
+            //
+            // Critically though `Task<Fut>` won't actually access `Fut`, the
+            // future, while it's floating around inside of wakers.
+            // These structs will basically just use `Fut` to size
+            // the internal allocation, appropriately accessing fields and
+            // deallocating the task if need be.
+            let res = {
+                let waker = Task::waker_ref(bomb.task.as_ref().unwrap());
+                let mut cx = Context::from_waker(&waker);
+
+                // Safety: We won't move the future ever again
+                let future = unsafe { Pin::new_unchecked(future) };
+
+                future.poll(&mut cx)
+            };
+            polled += 1;
+
+            match res {
+                Poll::Pending => {
+                    let task = bomb.task.take().unwrap();
+                    bomb.queue.link(task);
+
+                    if polled == yield_every {
+                        // We have polled a large number of futures in a row without yielding.
+                        // To ensure we do not starve other tasks waiting on the executor,
+                        // we yield here, but immediately wake ourselves up to continue.
+                        cx.waker().wake_by_ref();
+                        return Poll::Pending;
+                    }
+                    continue;
+                }
+                Poll::Ready(output) => return Poll::Ready(Some(output)),
+            }
+        }
+    }
+}
+
 impl<Fut: Future> Stream for FuturesUnordered<Fut> {
     type Item = Fut::Output;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Fut::Output>> {
         // See YIELD_EVERY docs　for more.
         let yield_every = cmp::min(self.len(), YIELD_EVERY);
 

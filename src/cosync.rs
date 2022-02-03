@@ -12,26 +12,18 @@ use std::{
     thread::{self, Thread},
 };
 
-use futures::{
-    executor::enter,
-    task::{waker_ref, ArcWake},
-    FutureExt, StreamExt,
-};
+use futures::task::{waker_ref, ArcWake};
 
-use super::futures::FuturesUnordered;
+use super::futures::{enter::enter, FuturesUnordered};
 
 /// A single-threaded task pool for polling futures to completion.
 ///
-/// This executor allows you to multiplex any number of tasks onto a single
-/// thread. It's appropriate to poll strictly I/O-bound futures that do very
-/// little work in between I/O actions.
+/// This executor allows you to queue multiple tasks in sequence, and to
+/// queue tasks within other tasks.
 ///
-/// To get a handle to the pool that implements
-/// [`Spawn`](futures_task::Spawn), use the
-/// [`spawner()`](LocalPool::spawner) method. Because the executor is
-/// single-threaded, it supports a special form of task spawning for non-`Send`
-/// futures, via [`spawn_local_obj`](futures_task::LocalSpawn::spawn_local_obj).
-// #[derive(Debug)]
+/// You can queue a task by using [queue](Cosync::queue), by spawning a [CosyncCoQueue]
+/// and calling [queue](CosyncCoQueue::queue), or, within a task, calling [queue_task](CosyncInput::queue)
+/// on [CosyncInput].
 pub struct Cosync<T> {
     pool: FuturesUnordered<FutureObject>,
     incoming: Arc<Mutex<VecDeque<IncomingObject>>>,
@@ -70,12 +62,12 @@ impl<T: 'static> CosyncInput<T> {
     }
 
     /// Adds a new Task to the TaskQueue.
-    pub fn add_task<Task, Out>(&mut self, task: Task)
+    pub fn queue<Task, Out>(&mut self, task: Task)
     where
         Task: Fn(CosyncInput<T>) -> Out + Send + 'static,
         Out: Future<Output = ()> + Send,
     {
-        add_task(task, self.0, &self.1)
+        queue_task(task, self.0, &self.1)
     }
 }
 
@@ -117,7 +109,7 @@ impl Future for FutureObject {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.0.poll_unpin(cx)
+        Pin::new(&mut self.0).poll(cx)
     }
 }
 
@@ -202,7 +194,7 @@ fn poll_executor<T, F: FnMut(&mut Context<'_>) -> T>(mut f: F) -> T {
 }
 
 /// Adds a new Task to the TaskQueue.
-fn add_task<T: 'static, Task, Out>(
+fn queue_task<T: 'static, Task, Out>(
     task: Task,
     position: *const Option<NonNull<T>>,
     incoming: &Arc<Mutex<VecDeque<IncomingObject>>>,
@@ -237,14 +229,14 @@ impl<T: 'static> Cosync<T> {
     }
 
     /// Adds a new Task to the TaskQueue.
-    pub fn add_task<Task, Out>(&mut self, task: Task)
+    pub fn queue<Task, Out>(&mut self, task: Task)
     where
         Task: Fn(CosyncInput<T>) -> Out + Send + 'static,
         Out: Future<Output = ()> + Send,
     {
         let position = &*self.data as *const Option<_>;
 
-        add_task(task, position, &self.incoming);
+        queue_task(task, position, &self.incoming);
     }
 
     // /// Get a clonable handle to the pool as a [`Spawn`].
@@ -438,7 +430,7 @@ impl<T: 'static> Cosync<T> {
         }
 
         // try to execute the next ready future
-        self.pool.poll_next_unpin(cx)
+        Pin::new(&mut self.pool).poll_next(cx)
     }
 }
 
@@ -575,14 +567,14 @@ mod tests {
         let mut value;
 
         let mut executor: Cosync<i32> = Cosync::new();
-        executor.add_task(move |mut input| async move {
+        executor.queue(move |mut input| async move {
             let mut input = input.get();
 
             assert_eq!(**input, 10);
             **input = 10;
         });
 
-        executor.add_task(move |mut input| async move {
+        executor.queue(move |mut input| async move {
             assert_eq!(**input.get(), 10);
 
             // this will make the executor sleep, stall,
@@ -612,7 +604,7 @@ mod tests {
         let mut value;
 
         let mut executor: Cosync<i32> = Cosync::new();
-        executor.add_task(move |mut input| async move {
+        executor.queue(move |mut input| async move {
             println!("starting task 1");
             **input.get() = 10;
 
@@ -621,7 +613,7 @@ mod tests {
             **input.get() = 20;
         });
 
-        executor.add_task(move |mut input| async move {
+        executor.queue(move |mut input| async move {
             assert_eq!(**input.get(), 20);
         });
 
@@ -635,11 +627,11 @@ mod tests {
         let mut value;
 
         let mut executor: Cosync<i32> = Cosync::new();
-        executor.add_task(move |mut input| async move {
+        executor.queue(move |mut input| async move {
             println!("starting task 1");
             **input.get() = 10;
 
-            input.add_task(move |mut input| async move {
+            input.queue(move |mut input| async move {
                 println!("starting task 3");
                 assert_eq!(**input.get(), 20);
 
@@ -647,7 +639,7 @@ mod tests {
             });
         });
 
-        executor.add_task(move |mut input| async move {
+        executor.queue(move |mut input| async move {
             println!("starting task 2");
             **input.get() = 20;
         });

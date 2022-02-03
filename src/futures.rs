@@ -1,5 +1,7 @@
 mod abort;
 
+pub mod enter;
+
 mod iter;
 pub use self::iter::{IntoIter, Iter, IterMut, IterPinMut, IterPinRef};
 
