@@ -565,7 +565,7 @@ mod tests {
 
         let mut executor: Cosync<&mut i32> = Cosync::new();
         executor.queue(move |mut input| async move {
-            let mut input = input.get::<&mut i32>();
+            let mut input = input.get();
 
             assert_eq!(**input, 10);
             **input = 0;
@@ -587,7 +587,7 @@ mod tests {
 
         let mut executor: Cosync<Passthrough<'_>> = Cosync::new();
         executor.queue(move |mut input| async move {
-            let input = input.get::<Passthrough>();
+            let input = input.get();
             let inner = &*input;
             assert_eq!(*inner.0, 16);
         });
