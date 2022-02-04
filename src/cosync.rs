@@ -2,7 +2,9 @@
 #![allow(clippy::bool_comparison)]
 
 use std::{
+    any::TypeId,
     collections::VecDeque,
+    fmt,
     future::Future,
     marker::PhantomData,
     ops,
@@ -45,8 +47,7 @@ pub struct Cosync<T> {
 #[derive(Debug)]
 pub struct CosyncInput {
     heap_ptr: *mut *mut (),
-    // __parameter_type: PhantomData<T>,
-    // stack: Arc<Mutex<VecDeque<IncomingObject>>>,
+    stack: Arc<Mutex<VecDeque<IncomingObject>>>,
 }
 
 impl CosyncInput {
@@ -56,24 +57,17 @@ impl CosyncInput {
         // that it's always present.
         let inner = unsafe { &mut *(*self.heap_ptr as *mut T) };
 
-        // when we unwrap this, we can also AsRef it
-        // let o = {
-        //     box_ref
-        //         .as_mut()
-        //         .expect("single executor was not initialized this run correctly")
-        // };
-
         CosyncInputGuard(inner)
     }
 
-    // /// Adds a new Task to the TaskQueue.
-    // pub fn queue<Task, Out>(&mut self, task: Task)
-    // where
-    //     Task: Fn(CosyncInput<T>) -> Out + Send + 'static,
-    //     Out: Future<Output = ()> + Send,
-    // {
-    //     queue_task(task, self.0, &self.1)
-    // }
+    /// Adds a new Task to the TaskQueue.
+    pub fn queue<Task, Out>(&mut self, task: Task)
+    where
+        Task: Fn(CosyncInput) -> Out + Send + 'static,
+        Out: Future<Output = ()> + Send,
+    {
+        queue_task(task, unsafe { &mut *self.heap_ptr }, &self.stack)
+    }
 }
 
 unsafe impl Send for CosyncInput {}
@@ -107,6 +101,12 @@ impl IncomingObject {
     /// This should only be done once `data` is valid.
     pub unsafe fn into_future_object(self) -> FutureObject {
         FutureObject(self.0())
+    }
+}
+
+impl fmt::Debug for IncomingObject {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IncomingObject").finish_non_exhaustive()
     }
 }
 
@@ -209,7 +209,10 @@ fn queue_task<Task, Out>(
     Out: Future<Output = ()> + Send,
 {
     // force the future to move...
-    let sec = CosyncInput { heap_ptr };
+    let sec = CosyncInput {
+        heap_ptr,
+        stack: incoming.clone(),
+    };
 
     let our_cb = Box::new(move || {
         let output = Box::pin(async move {
