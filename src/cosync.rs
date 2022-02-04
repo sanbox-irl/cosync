@@ -2,7 +2,6 @@ use std::{
     collections::VecDeque,
     fmt,
     future::Future,
-    marker::PhantomData,
     ops,
     pin::Pin,
     ptr::NonNull,
@@ -29,8 +28,7 @@ use super::futures::{enter::enter, FuturesUnordered};
 pub struct Cosync<T> {
     pool: FuturesUnordered<FutureObject>,
     incoming: Arc<Mutex<VecDeque<IncomingObject>>>,
-    data: Box<Option<NonNull<()>>>,
-    __parameter_type: PhantomData<T>,
+    data: Box<Option<NonNull<T>>>,
 }
 
 /// Guarded Input.
@@ -40,43 +38,49 @@ pub struct Cosync<T> {
 ///
 /// #add_task: Self::queue
 /// #get: Self::get
-#[derive(Debug)]
-pub struct CosyncInput {
-    heap_ptr: *const Option<NonNull<()>>,
-    // __parameter_type: PhantomData<T>,
-    // stack: Arc<Mutex<VecDeque<IncomingObject>>>,
+pub struct CosyncInput<T> {
+    heap_ptr: *const Option<NonNull<T>>,
+    incoming: Arc<Mutex<VecDeque<IncomingObject>>>,
 }
 
-impl CosyncInput {
+impl<T: 'static> CosyncInput<T> {
     /// Gets the underlying [CosyncInputGuard]
-    pub fn get<T>(&mut self) -> CosyncInputGuard<'_, T> {
+    pub fn get(&mut self) -> CosyncInputGuard<'_, T> {
         // we can always dereference this data, as we maintain
         // that it's always present.
-        let box_ref: &mut Option<T> =
-            unsafe { &mut *(self.heap_ptr as *const Option<T> as *mut _) };
+        let box_ref = unsafe { &*self.heap_ptr };
 
         // when we unwrap this, we can also AsRef it
-        let o = {
+        let o = unsafe {
             box_ref
-                .as_mut()
                 .expect("single executor was not initialized this run correctly")
+                .as_mut()
         };
 
         CosyncInputGuard(o)
     }
 
-    // /// Adds a new Task to the TaskQueue.
-    // pub fn queue<Task, Out>(&mut self, task: Task)
-    // where
-    //     Task: Fn(CosyncInput<T>) -> Out + Send + 'static,
-    //     Out: Future<Output = ()> + Send,
-    // {
-    //     queue_task(task, self.0, &self.1)
-    // }
+    /// Adds a new Task to the TaskQueue.
+    pub fn queue<Task, Out>(&mut self, task: Task)
+    where
+        Task: Fn(CosyncInput<T>) -> Out + Send + 'static,
+        Out: Future<Output = ()> + Send,
+    {
+        queue_task(task, self.heap_ptr, &self.incoming)
+    }
 }
 
-unsafe impl Send for CosyncInput {}
-unsafe impl Sync for CosyncInput {}
+unsafe impl<T> Send for CosyncInput<T> {}
+unsafe impl<T> Sync for CosyncInput<T> {}
+
+impl<T> fmt::Debug for CosyncInput<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("CosyncInput")
+            .field(&self.heap_ptr)
+            .field(&"IncomingQueue")
+            .finish()
+    }
+}
 
 /// A guarded pointer. This exists to prevent holding onto
 /// the `CosyncInputGuard` over `.await` calls. It will need
@@ -84,16 +88,16 @@ unsafe impl Sync for CosyncInput {}
 pub struct CosyncInputGuard<'a, T>(&'a mut T);
 
 impl<'a, T> ops::Deref for CosyncInputGuard<'a, T> {
-    type Target = T;
+    type Target = &'a mut T;
 
     fn deref(&self) -> &Self::Target {
-        self.0
+        &self.0
     }
 }
 
 impl<'a, T> ops::DerefMut for CosyncInputGuard<'a, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.0
+        &mut self.0
     }
 }
 
@@ -198,16 +202,20 @@ fn poll_executor<T, F: FnMut(&mut Context<'_>) -> T>(mut f: F) -> T {
 }
 
 /// Adds a new Task to the TaskQueue.
-fn queue_task<Task, Out>(
+fn queue_task<T: 'static, Task, Out>(
     task: Task,
-    heap_ptr: *const Option<NonNull<()>>,
+    heap_ptr: *const Option<NonNull<T>>,
     incoming: &Arc<Mutex<VecDeque<IncomingObject>>>,
 ) where
-    Task: Fn(CosyncInput) -> Out + Send + 'static,
+    Task: Fn(CosyncInput<T>) -> Out + Send + 'static,
     Out: Future<Output = ()> + Send,
 {
     // force the future to move...
-    let sec = CosyncInput { heap_ptr };
+    let task = task;
+    let sec = CosyncInput {
+        heap_ptr,
+        incoming: incoming.clone(),
+    };
 
     let our_cb = Box::new(move || {
         let output = Box::pin(async move {
@@ -221,24 +229,23 @@ fn queue_task<Task, Out>(
     incoming.lock().unwrap().push_back(IncomingObject(our_cb));
 }
 
-impl<T> Cosync<T> {
+impl<T: 'static> Cosync<T> {
     /// Create a new, empty pool of tasks.
     pub fn new() -> Self {
         Self {
             pool: FuturesUnordered::new(),
             incoming: Default::default(),
             data: Box::new(None),
-            __parameter_type: PhantomData,
         }
     }
 
     /// Adds a new Task to the TaskQueue.
     pub fn queue<Task, Out>(&mut self, task: Task)
     where
-        Task: Fn(CosyncInput) -> Out + Send + 'static,
+        Task: Fn(CosyncInput<T>) -> Out + Send + 'static,
         Out: Future<Output = ()> + Send,
     {
-        let position = &*self.data as *const Option<NonNull<()>>;
+        let position = &*self.data as *const Option<_>;
 
         queue_task(task, position, &self.incoming);
     }
@@ -258,17 +265,17 @@ impl<T> Cosync<T> {
     ///
     /// The function will block the calling thread until *all* tasks in the pool
     /// are complete, including any spawned while running existing tasks.
-    // pub fn run(&mut self, parameter: &mut T) {
-    //     // hoist the T:
-    //     unsafe {
-    //         *self.data = Some(NonNull::new_unchecked(parameter as *mut _));
-    //     }
+    pub fn run(&mut self, parameter: &mut T) {
+        // hoist the T:
+        unsafe {
+            *self.data = Some(NonNull::new_unchecked(parameter as *mut _));
+        }
 
-    //     run_executor(|cx| self.poll_pool(cx));
+        run_executor(|cx| self.poll_pool(cx));
 
-    //     // for segfault help, we null here
-    //     *self.data = None;
-    // }
+        // for segfault help, we null here
+        *self.data = None;
+    }
 
     /// Runs all the tasks in the pool until the given future completes.
     ///
@@ -381,10 +388,10 @@ impl<T> Cosync<T> {
     /// remaining incomplete tasks in the pool can continue with further use of one
     /// of the pool's run or poll methods. While the function is running, all tasks
     /// in the pool will try to make progress.
-    pub fn run_until_stalled(&mut self, mut parameter: T) {
+    pub fn run_until_stalled(&mut self, parameter: &mut T) {
         // hoist the T:
         unsafe {
-            *self.data = Some(NonNull::new_unchecked(&mut parameter as *mut _ as *mut _));
+            *self.data = Some(NonNull::new_unchecked(parameter as *mut _));
         }
 
         poll_executor(|ctx| {
@@ -562,17 +569,34 @@ mod tests {
         // notice that value is declared here
         let mut value;
 
-        let mut executor: Cosync<&mut i32> = Cosync::new();
+        let mut executor: Cosync<i32> = Cosync::new();
         executor.queue(move |mut input| async move {
-            let mut input = input.get::<&mut i32>();
+            let mut input = input.get();
 
             assert_eq!(**input, 10);
-            **input = 0;
+            **input = 10;
+        });
+
+        executor.queue(move |mut input| async move {
+            assert_eq!(**input.get(), 10);
+
+            // this will make the executor sleep, stall,
+            // and exit out of this tick
+            // we call `run_until_stalled` an additional time,
+            // so we'll complete this 1 tick sleep.
+            let sleep = SleepForTick(1);
+            sleep.await;
+
+            let input = &mut **input.get();
+            assert_eq!(*input, 30);
+            *input = 0;
         });
 
         // initialized here, after tasks are made
         // (so code is correctly being deferred)
         value = 10;
+        executor.run_until_stalled(&mut value);
+        value = 30;
         executor.run_until_stalled(&mut value);
         assert_eq!(value, 0);
     }
@@ -582,18 +606,18 @@ mod tests {
         // notice that value is declared here
         let mut value;
 
-        let mut executor: Cosync<&mut i32> = Cosync::new();
+        let mut executor: Cosync<i32> = Cosync::new();
         executor.queue(move |mut input| async move {
             println!("starting task 1");
-            **input.get::<&mut i32>() = 10;
+            **input.get() = 10;
 
             sleep_ticks(100).await;
 
-            **input.get::<&mut i32>() = 20;
+            **input.get() = 20;
         });
 
         executor.queue(move |mut input| async move {
-            assert_eq!(**input.get::<&mut i32>(), 20);
+            assert_eq!(**input.get(), 20);
         });
 
         value = 0;
@@ -605,32 +629,29 @@ mod tests {
         // notice that value is declared here
         let mut value;
 
-        let mut executor: Cosync<&mut i32> = Cosync::new();
+        let mut executor: Cosync<i32> = Cosync::new();
         executor.queue(move |mut input| async move {
             println!("starting task 1");
-            let mut input = input.get::<&mut i32>();
-            // input
-            // let input = **input;
-            // *input = 10;
+            **input.get() = 10;
 
-            // input.queue(move |mut input| async move {
-            //     println!("starting task 3");
-            //     assert_eq!(**input.get(), 20);
+            input.queue(move |mut input| async move {
+                println!("starting task 3");
+                assert_eq!(**input.get(), 20);
 
-            //     **input.get() = 30;
-            // });
+                **input.get() = 30;
+            });
         });
 
         executor.queue(move |mut input| async move {
             println!("starting task 2");
-            **input.get::<&mut i32>() = 20;
+            **input.get() = 20;
         });
 
         // initialized here, after tasks are made
         // (so code is correctly being deferred)
         value = 0;
         executor.run_until_stalled(&mut value);
-        assert_eq!(value, 20);
+        assert_eq!(value, 30);
     }
 
     // THIS SHOULD NOT COMPILE!!

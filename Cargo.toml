@@ -6,7 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-futures = { path = "../futures-rs/futures" }
+futures = "0.3.19"
 
 [dev-dependencies]
 static_assertions = "1.1"
