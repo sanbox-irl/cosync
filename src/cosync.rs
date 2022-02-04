@@ -44,14 +44,15 @@ pub struct Cosync<T> {
 /// #add_task: Self::queue
 /// #get: Self::get
 #[derive(Debug)]
-pub struct CosyncInput {
+pub struct CosyncInput<T> {
     heap_ptr: *mut *mut (),
     stack: Arc<Mutex<VecDeque<IncomingObject>>>,
+    __parameter_type: PhantomData<T>,
 }
 
-impl CosyncInput {
+impl<T> CosyncInput<T> {
     /// Gets the underlying [CosyncInputGuard]
-    pub fn get<T>(&mut self) -> CosyncInputGuard<'_, T> {
+    pub fn get(&mut self) -> CosyncInputGuard<'_, T> {
         // we can always dereference this data, as we maintain
         // that it's always present.
         let inner = unsafe { &mut *(*self.heap_ptr as *mut T) };
@@ -62,15 +63,15 @@ impl CosyncInput {
     /// Adds a new Task to the TaskQueue.
     pub fn queue<Task, Out>(&mut self, task: Task)
     where
-        Task: Fn(CosyncInput) -> Out + Send + 'static,
+        Task: Fn(CosyncInput<T>) -> Out + Send + 'static,
         Out: Future<Output = ()> + Send,
     {
         queue_task(task, unsafe { &mut *self.heap_ptr }, &self.stack)
     }
 }
 
-unsafe impl Send for CosyncInput {}
-unsafe impl Sync for CosyncInput {}
+unsafe impl<T> Send for CosyncInput<T> {}
+unsafe impl<T> Sync for CosyncInput<T> {}
 
 /// A guarded pointer. This exists to prevent holding onto
 /// the `CosyncInputGuard` over `.await` calls. It will need
@@ -199,18 +200,19 @@ fn poll_executor<T, F: FnMut(&mut Context<'_>) -> T>(mut f: F) -> T {
 }
 
 /// Adds a new Task to the TaskQueue.
-fn queue_task<Task, Out>(
+fn queue_task<T, Task, Out>(
     task: Task,
     heap_ptr: &mut *mut (),
     incoming: &Arc<Mutex<VecDeque<IncomingObject>>>,
 ) where
-    Task: Fn(CosyncInput) -> Out + Send + 'static,
+    Task: Fn(CosyncInput<T>) -> Out + Send + 'static,
     Out: Future<Output = ()> + Send,
 {
     // force the future to move...
     let sec = CosyncInput {
         heap_ptr,
         stack: incoming.clone(),
+        __parameter_type: PhantomData,
     };
 
     let our_cb = Box::new(move || {
@@ -239,7 +241,7 @@ impl<T> Cosync<T> {
     /// Adds a new Task to the TaskQueue.
     pub fn queue<Task, Out>(&mut self, task: Task)
     where
-        Task: Fn(CosyncInput) -> Out + Send + 'static,
+        Task: Fn(CosyncInput<T>) -> Out + Send + 'static,
         Out: Future<Output = ()> + Send,
     {
         queue_task(task, &mut self.data, &self.incoming);
