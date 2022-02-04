@@ -1,11 +1,13 @@
+#![deny(rust_2018_idioms)]
+#![allow(clippy::bool_comparison)]
+
 use std::{
     collections::VecDeque,
-    fmt,
     future::Future,
     marker::PhantomData,
     ops,
     pin::Pin,
-    ptr::NonNull,
+    ptr,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -29,7 +31,7 @@ use super::futures::{enter::enter, FuturesUnordered};
 pub struct Cosync<T> {
     pool: FuturesUnordered<FutureObject>,
     incoming: Arc<Mutex<VecDeque<IncomingObject>>>,
-    data: Box<Option<NonNull<()>>>,
+    data: Box<*mut ()>,
     __parameter_type: PhantomData<T>,
 }
 
@@ -42,7 +44,7 @@ pub struct Cosync<T> {
 /// #get: Self::get
 #[derive(Debug)]
 pub struct CosyncInput {
-    heap_ptr: *const Option<NonNull<()>>,
+    heap_ptr: *mut *mut (),
     // __parameter_type: PhantomData<T>,
     // stack: Arc<Mutex<VecDeque<IncomingObject>>>,
 }
@@ -52,17 +54,16 @@ impl CosyncInput {
     pub fn get<T>(&mut self) -> CosyncInputGuard<'_, T> {
         // we can always dereference this data, as we maintain
         // that it's always present.
-        let box_ref: &mut Option<T> =
-            unsafe { &mut *(self.heap_ptr as *const Option<T> as *mut _) };
+        let inner = unsafe { &mut *(*self.heap_ptr as *mut T) };
 
         // when we unwrap this, we can also AsRef it
-        let o = {
-            box_ref
-                .as_mut()
-                .expect("single executor was not initialized this run correctly")
-        };
+        // let o = {
+        //     box_ref
+        //         .as_mut()
+        //         .expect("single executor was not initialized this run correctly")
+        // };
 
-        CosyncInputGuard(o)
+        CosyncInputGuard(inner)
     }
 
     // /// Adds a new Task to the TaskQueue.
@@ -81,6 +82,7 @@ unsafe impl Sync for CosyncInput {}
 /// A guarded pointer. This exists to prevent holding onto
 /// the `CosyncInputGuard` over `.await` calls. It will need
 /// to be fetched again from [CosyncInput] after awaits.
+#[derive(Debug)]
 pub struct CosyncInputGuard<'a, T>(&'a mut T);
 
 impl<'a, T> ops::Deref for CosyncInputGuard<'a, T> {
@@ -200,7 +202,7 @@ fn poll_executor<T, F: FnMut(&mut Context<'_>) -> T>(mut f: F) -> T {
 /// Adds a new Task to the TaskQueue.
 fn queue_task<Task, Out>(
     task: Task,
-    heap_ptr: *const Option<NonNull<()>>,
+    heap_ptr: &mut *mut (),
     incoming: &Arc<Mutex<VecDeque<IncomingObject>>>,
 ) where
     Task: Fn(CosyncInput) -> Out + Send + 'static,
@@ -227,7 +229,7 @@ impl<T> Cosync<T> {
         Self {
             pool: FuturesUnordered::new(),
             incoming: Default::default(),
-            data: Box::new(None),
+            data: Box::new(ptr::null_mut()),
             __parameter_type: PhantomData,
         }
     }
@@ -238,9 +240,7 @@ impl<T> Cosync<T> {
         Task: Fn(CosyncInput) -> Out + Send + 'static,
         Out: Future<Output = ()> + Send,
     {
-        let position = &*self.data as *const Option<NonNull<()>>;
-
-        queue_task(task, position, &self.incoming);
+        queue_task(task, &mut self.data, &self.incoming);
     }
 
     /// Run all tasks in the pool to completion.
@@ -383,16 +383,13 @@ impl<T> Cosync<T> {
     /// in the pool will try to make progress.
     pub fn run_until_stalled(&mut self, mut parameter: T) {
         // hoist the T:
-        unsafe {
-            *self.data = Some(NonNull::new_unchecked(&mut parameter as *mut T as *mut ()));
-        }
+        *self.data = &mut parameter as *mut T as *mut _;
 
         poll_executor(|ctx| {
             let _ = self.poll_pool(ctx);
         });
 
-        // null it
-        *self.data = None;
+        *self.data = ptr::null_mut();
     }
 
     // Make maximal progress on the entire pool of spawned task, returning `Ready`
@@ -575,6 +572,23 @@ mod tests {
         value = 10;
         executor.run_until_stalled(&mut value);
         assert_eq!(value, 0);
+    }
+
+    #[test]
+    fn second_thing() {
+        let value = 16;
+
+        struct Passthrough<'a>(&'a i32);
+        let pass_through = Passthrough(&value);
+
+        let mut executor: Cosync<Passthrough<'_>> = Cosync::new();
+        executor.queue(move |mut input| async move {
+            let input = input.get::<Passthrough>();
+            let inner = &*input;
+            assert_eq!(*inner.0, 16);
+        });
+
+        executor.run_until_stalled(pass_through);
     }
 
     // #[test]
