@@ -1,8 +1,7 @@
-#![deny(rust_2018_idioms)]
-#![allow(clippy::bool_comparison)]
+// #![deny(rust_2018_idioms)]
+// #![allow(clippy::bool_comparison)]
 
 use std::{
-    any::TypeId,
     collections::VecDeque,
     fmt,
     future::Future,
@@ -154,37 +153,37 @@ impl ArcWake for ThreadNotify {
 
 // Set up and run a basic single-threaded spawner loop, invoking `f` on each
 // turn.
-fn run_executor<T, F>(mut work_on_future: F) -> T
-where
-    F: FnMut(&mut Context<'_>) -> Poll<T>,
-{
-    let _enter = enter().expect(
-        "cannot execute `LocalPool` executor from within \
-         another executor",
-    );
+// fn run_executor<T, F>(mut work_on_future: F) -> T
+// where
+//     F: FnMut(&mut Context<'_>) -> Poll<T>,
+// {
+//     let _enter = enter().expect(
+//         "cannot execute `LocalPool` executor from within \
+//          another executor",
+//     );
 
-    CURRENT_THREAD_NOTIFY.with(|thread_notify| {
-        let waker = waker_ref(thread_notify);
-        let mut cx = Context::from_waker(&waker);
-        loop {
-            if let Poll::Ready(t) = work_on_future(&mut cx) {
-                return t;
-            }
-            // Consume the wakeup that occurred while executing `f`, if any.
-            let unparked = thread_notify.unparked.swap(false, Ordering::Acquire);
-            if !unparked {
-                // No wakeup occurred. It may occur now, right before parking,
-                // but in that case the token made available by `unpark()`
-                // is guaranteed to still be available and `park()` is a no-op.
-                thread::park();
-                // When the thread is unparked, `unparked` will have been set
-                // and needs to be unset before the next call to `f` to avoid
-                // a redundant loop iteration.
-                thread_notify.unparked.store(false, Ordering::Release);
-            }
-        }
-    })
-}
+//     CURRENT_THREAD_NOTIFY.with(|thread_notify| {
+//         let waker = waker_ref(thread_notify);
+//         let mut cx = Context::from_waker(&waker);
+//         loop {
+//             if let Poll::Ready(t) = work_on_future(&mut cx) {
+//                 return t;
+//             }
+//             // Consume the wakeup that occurred while executing `f`, if any.
+//             let unparked = thread_notify.unparked.swap(false, Ordering::Acquire);
+//             if !unparked {
+//                 // No wakeup occurred. It may occur now, right before parking,
+//                 // but in that case the token made available by `unpark()`
+//                 // is guaranteed to still be available and `park()` is a no-op.
+//                 thread::park();
+//                 // When the thread is unparked, `unparked` will have been set
+//                 // and needs to be unset before the next call to `f` to avoid
+//                 // a redundant loop iteration.
+//                 thread_notify.unparked.store(false, Ordering::Release);
+//             }
+//         }
+//     })
+// }
 
 fn poll_executor<T, F: FnMut(&mut Context<'_>) -> T>(mut f: F) -> T {
     let _enter = enter().expect(
