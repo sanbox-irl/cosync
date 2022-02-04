@@ -33,7 +33,7 @@ pub struct Cosync<T> {
     pool: FuturesUnordered<FutureObject>,
     incoming: Arc<Mutex<VecDeque<IncomingObject>>>,
     data: Box<*mut ()>,
-    __parameter_type: PhantomData<T>,
+    __parameter_type: PhantomData<fn(&mut T)>,
 }
 
 /// Guarded Input.
@@ -47,7 +47,7 @@ pub struct Cosync<T> {
 pub struct CosyncInput<T> {
     heap_ptr: *mut *mut (),
     stack: Arc<Mutex<VecDeque<IncomingObject>>>,
-    __parameter_type: PhantomData<T>,
+    __parameter_type: PhantomData<fn(&T)>,
 }
 
 impl<T> CosyncInput<T> {
