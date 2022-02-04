@@ -1,5 +1,6 @@
 use std::{
     collections::VecDeque,
+    fmt,
     future::Future,
     ops,
     pin::Pin,
@@ -33,16 +34,14 @@ pub struct Cosync<T> {
 /// Guarded Input.
 ///
 /// Its primary role is to create a [CosyncInputGuard] by [get] and to queue
-/// more tasks by [add_task]
+/// more tasks by [queue]
 ///
-/// #add_task: Self::add_task
+/// #add_task: Self::queue
 /// #get: Self::get
 pub struct CosyncInput<T>(
     *const Option<NonNull<T>>,
     Arc<Mutex<VecDeque<IncomingObject>>>,
 );
-
-// static_assertions::assert_impl_all!(Arc<Mutex<VecDeque<IncomingObject>>> : Send, Sync);
 
 impl<T: 'static> CosyncInput<T> {
     /// Gets the underlying [CosyncInputGuard]
@@ -74,6 +73,15 @@ impl<T: 'static> CosyncInput<T> {
 unsafe impl<T> Send for CosyncInput<T> {}
 unsafe impl<T> Sync for CosyncInput<T> {}
 
+impl<T> fmt::Debug for CosyncInput<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("CosyncInput")
+            .field(&self.0)
+            .field(&"IncomingQueue")
+            .finish()
+    }
+}
+
 /// A guarded pointer. This exists to prevent holding onto
 /// the `CosyncInputGuard` over `.await` calls. It will need
 /// to be fetched again from [CosyncInput] after awaits.
@@ -95,8 +103,8 @@ impl<'a, T> ops::DerefMut for CosyncInputGuard<'a, T> {
 
 type IncomingOutput = Pin<Box<dyn Future<Output = ()> + 'static>>;
 type IncomingInner = Box<dyn FnOnce() -> IncomingOutput + Send + 'static>;
-struct IncomingObject(IncomingInner);
 
+struct IncomingObject(IncomingInner);
 impl IncomingObject {
     /// This should only be done once `data` is valid.
     pub unsafe fn into_future_object(self) -> FutureObject {
@@ -238,14 +246,6 @@ impl<T: 'static> Cosync<T> {
 
         queue_task(task, position, &self.incoming);
     }
-
-    // /// Get a clonable handle to the pool as a [`Spawn`].
-    // pub fn spawner(&self) -> LocalSpawner<T> {
-    //     LocalSpawner {
-    //         incoming: Rc::downgrade(&self.incoming),
-    //         __phantom: PhantomData,
-    //     }
-    // }
 
     /// Run all tasks in the pool to completion.
     ///
