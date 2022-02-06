@@ -10,12 +10,10 @@ use std::{
         Arc, Mutex,
     },
     task::{Context, Poll},
-    thread::{self, Thread},
+    thread,
 };
 
-use futures::task::{waker_ref, ArcWake};
-
-use super::futures::{enter::enter, FuturesUnordered};
+use crate::futures::{enter::enter, FuturesUnordered, ThreadNotify};
 
 /// A single-threaded task pool for polling futures to completion.
 ///
@@ -247,37 +245,11 @@ impl Future for FutureObject {
     }
 }
 
-pub(crate) struct ThreadNotify {
-    /// The (single) executor thread.
-    thread: Thread,
-    /// A flag to ensure a wakeup (i.e. `unpark()`) is not "forgotten"
-    /// before the next `park()`, which may otherwise happen if the code
-    /// being executed as part of the future(s) being polled makes use of
-    /// park / unpark calls of its own, i.e. we cannot assume that no other
-    /// code uses park / unpark on the executing `thread`.
-    unparked: AtomicBool,
-}
-
 thread_local! {
     static CURRENT_THREAD_NOTIFY: Arc<ThreadNotify> = Arc::new(ThreadNotify {
         thread: thread::current(),
         unparked: AtomicBool::new(false),
     });
-}
-
-impl ArcWake for ThreadNotify {
-    fn wake_by_ref(arc_self: &Arc<Self>) {
-        // Make sure the wakeup is remembered until the next `park()`.
-        let unparked = arc_self.unparked.swap(true, Ordering::Relaxed);
-        if !unparked {
-            // If the thread has not been unparked yet, it must be done
-            // now. If it was actually parked, it will run again,
-            // otherwise the token made available by `unpark`
-            // may be consumed before reaching `park()`, but `unparked`
-            // ensures it is not forgotten.
-            arc_self.thread.unpark();
-        }
-    }
 }
 
 // Set up and run a basic single-threaded spawner loop, invoking `f` on each
@@ -292,7 +264,7 @@ where
     );
 
     CURRENT_THREAD_NOTIFY.with(|thread_notify| {
-        let waker = waker_ref(thread_notify);
+        let waker = thread_notify.waker_ref();
         let mut cx = Context::from_waker(&waker);
         loop {
             if let Poll::Ready(t) = work_on_future(&mut cx) {
@@ -321,7 +293,7 @@ fn poll_executor<T, F: FnMut(&mut Context<'_>) -> T>(mut f: F) -> T {
     );
 
     CURRENT_THREAD_NOTIFY.with(|thread_notify| {
-        let waker = waker_ref(thread_notify);
+        let waker = thread_notify.waker_ref();
         let mut cx = Context::from_waker(&waker);
         f(&mut cx)
     })

@@ -13,3 +13,9 @@ use self::task::Task;
 
 mod ready_to_run_queue;
 use self::ready_to_run_queue::{Dequeue, ReadyToRunQueue};
+
+mod waker_ref;
+pub use waker_ref::WakerRef;
+
+mod thread_notify;
+pub(crate) use thread_notify::ThreadNotify;
