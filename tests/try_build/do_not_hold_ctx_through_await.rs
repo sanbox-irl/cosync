@@ -15,7 +15,7 @@ pub fn main() {
     });
 
     let mut one_value = 10;
-    executor.run_until_stalled(&mut one_value);
+    executor.run_until_stall(&mut one_value);
     let mut two_value = 100;
-    executor.run_until_stalled(&mut two_value);
+    executor.run_until_stall(&mut two_value);
 }
