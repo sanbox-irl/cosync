@@ -17,7 +17,7 @@ note: future is not `Send` as this value is used across an await
 15  |     });
     |     - `mut inner_input` is later dropped here
 note: required by a bound in `Cosync::<T>::queue`
-   --> src/cosync.rs
+   --> src/lib.rs
     |
     |         Out: Future<Output = ()> + Send,
     |                                    ^^^^ required by this bound in `Cosync::<T>::queue`
