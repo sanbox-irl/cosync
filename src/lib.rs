@@ -1,11 +1,12 @@
 #![doc = include_str!("../README.md")]
 #![deny(rust_2018_idioms)]
 #![deny(missing_docs)]
-#![deny(rustdoc::missing_doc_code_examples)]
+#![deny(rustdoc::all)]
 
 // this is vendored code from the `futures-rs` crate, to avoid
 // having a huge dependency when we only need a little bit
 mod futures;
+use crate::futures::{enter::enter, waker_ref, ArcWake, FuturesUnordered};
 
 use std::{
     collections::VecDeque,
@@ -22,10 +23,6 @@ use std::{
     task::{Context, Poll},
     thread::{self, Thread},
 };
-
-use futures::arc_wake::ArcWake;
-
-use crate::futures::{enter::enter, waker_ref, FuturesUnordered};
 
 /// A single-threaded, sequential, parameterized async task queue.
 ///

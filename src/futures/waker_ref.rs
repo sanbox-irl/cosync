@@ -6,7 +6,7 @@ use std::{
     task::{RawWaker, RawWakerVTable, Waker},
 };
 
-use super::arc_wake::ArcWake;
+use super::ArcWake;
 
 /// A [`Waker`] that is only valid for a given lifetime.
 ///

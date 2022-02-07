@@ -9,7 +9,6 @@ use std::{
     fmt::{self, Debug},
     future::Future,
     iter::FromIterator,
-    marker::PhantomData,
     mem,
     pin::Pin,
     ptr,
@@ -23,9 +22,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use super::{
-    atomic_waker::AtomicWaker, Dequeue, IntoIter, Iter, IterMut, IterPinMut, IterPinRef, ReadyToRunQueue, Task,
-};
+use super::{atomic_waker::AtomicWaker, Dequeue, ReadyToRunQueue, Task};
 
 /// Constant used for a `FuturesUnordered` to determine how many times it is
 /// allowed to poll underlying futures without yielding.
@@ -208,53 +205,6 @@ impl<Fut> FuturesUnordered<Fut> {
         // futures are ready. To do that we unconditionally enqueue it for
         // polling here.
         self.ready_to_run_queue.enqueue(ptr);
-    }
-
-    /// Returns an iterator that allows inspecting each future in the set.
-    pub fn iter(&self) -> Iter<'_, Fut>
-    where
-        Fut: Unpin,
-    {
-        Iter(Pin::new(self).iter_pin_ref())
-    }
-
-    /// Returns an iterator that allows inspecting each future in the set.
-    pub fn iter_pin_ref(self: Pin<&Self>) -> IterPinRef<'_, Fut> {
-        let (task, len) = self.atomic_load_head_and_len_all();
-        let pending_next_all = self.pending_next_all();
-
-        IterPinRef {
-            task,
-            len,
-            pending_next_all,
-            _marker: PhantomData,
-        }
-    }
-
-    /// Returns an iterator that allows modifying each future in the set.
-    pub fn iter_mut(&mut self) -> IterMut<'_, Fut>
-    where
-        Fut: Unpin,
-    {
-        IterMut(Pin::new(self).iter_pin_mut())
-    }
-
-    /// Returns an iterator that allows modifying each future in the set.
-    pub fn iter_pin_mut(mut self: Pin<&mut Self>) -> IterPinMut<'_, Fut> {
-        // `head_all` can be accessed directly and we don't need to spin on
-        // `Task::next_all` since we have exclusive access to the set.
-        let task = *self.head_all.get_mut();
-        let len = if task.is_null() {
-            0
-        } else {
-            unsafe { *(*task).len_all.get() }
-        };
-
-        IterPinMut {
-            task,
-            len,
-            _marker: PhantomData,
-        }
     }
 
     /// Returns the current head node and number of futures in the list of all
@@ -572,6 +522,7 @@ impl<Fut> Debug for FuturesUnordered<Fut> {
 
 impl<Fut> FuturesUnordered<Fut> {
     /// Clears the set, removing all futures.
+    #[allow(dead_code)] // we'll probably add an API for editing the current future
     pub fn clear(&mut self) {
         self.clear_head_all();
 
@@ -613,42 +564,6 @@ impl<Fut> Drop for FuturesUnordered<Fut> {
     }
 }
 
-impl<'a, Fut: Unpin> IntoIterator for &'a FuturesUnordered<Fut> {
-    type Item = &'a Fut;
-    type IntoIter = Iter<'a, Fut>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.iter()
-    }
-}
-
-impl<'a, Fut: Unpin> IntoIterator for &'a mut FuturesUnordered<Fut> {
-    type Item = &'a mut Fut;
-    type IntoIter = IterMut<'a, Fut>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.iter_mut()
-    }
-}
-
-impl<Fut: Unpin> IntoIterator for FuturesUnordered<Fut> {
-    type Item = Fut;
-    type IntoIter = IntoIter<Fut>;
-
-    fn into_iter(mut self) -> Self::IntoIter {
-        // `head_all` can be accessed directly and we don't need to spin on
-        // `Task::next_all` since we have exclusive access to the set.
-        let task = *self.head_all.get_mut();
-        let len = if task.is_null() {
-            0
-        } else {
-            unsafe { *(*task).len_all.get() }
-        };
-
-        IntoIter { len, inner: self }
-    }
-}
-
 impl<Fut> FromIterator<Fut> for FuturesUnordered<Fut> {
     fn from_iter<I>(iter: I) -> Self
     where
@@ -661,20 +576,3 @@ impl<Fut> FromIterator<Fut> for FuturesUnordered<Fut> {
         })
     }
 }
-
-// impl<Fut: Future> FusedStream for FuturesUnordered<Fut> {
-//     fn is_terminated(&self) -> bool {
-//         self.is_terminated.load(Relaxed)
-//     }
-// }
-
-// impl<Fut> Extend<Fut> for FuturesUnordered<Fut> {
-//     fn extend<I>(&mut self, iter: I)
-//     where
-//         I: IntoIterator<Item = Fut>,
-//     {
-//         for item in iter {
-//             self.push(item);
-//         }
-//     }
-// }

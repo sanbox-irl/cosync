@@ -10,7 +10,7 @@ use std::{
     },
 };
 
-use super::{abort::abort, atomic_waker::AtomicWaker, task::Task};
+use super::{abort, atomic_waker::AtomicWaker, task::Task};
 
 pub(super) enum Dequeue<Fut> {
     Data(*const Task<Fut>),
