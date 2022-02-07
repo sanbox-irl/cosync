@@ -16,7 +16,6 @@ jobs:
       matrix:
         rust:
           - stable
-          - beta
         os:
           - ubuntu-latest
     steps:
