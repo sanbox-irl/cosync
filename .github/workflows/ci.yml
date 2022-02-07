@@ -57,6 +57,5 @@ jobs:
             ${{ runner.os }}-target-test-${{ matrix.rust }}-${{ hashFiles('**/Cargo.toml') }}
             ${{ runner.os }}-target-test-${{ matrix.rust }}-
 
-      # feature testing
-      - name: no features
+      - name: test
         run: cargo test

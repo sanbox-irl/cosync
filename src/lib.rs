@@ -54,7 +54,7 @@ pub struct Cosync<T> {
 ///
 /// // make a thread and join it...
 /// std::thread::spawn(move || {
-///     handler.queue_task(|mut input| async move {
+///     handler.queue(|mut input| async move {
 ///         *input.get() = 20;
 ///     });
 /// })
