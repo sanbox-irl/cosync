@@ -37,14 +37,6 @@ impl std::error::Error for EnterError {}
 /// execute a tasks, and drop the returned [`Enter`](Enter) value after
 /// completing task execution:
 ///
-/// ```
-/// use futures::executor::enter;
-///
-/// let enter = enter().expect("...");
-/// /* run task */
-/// drop(enter);
-/// ```
-///
 /// Doing so ensures that executors aren't
 /// accidentally invoked in a nested fashion.
 ///

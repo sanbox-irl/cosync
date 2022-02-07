@@ -33,68 +33,6 @@ use core::{
 ///
 /// For concurrent calls to `register` (should be avoided) the ordering is only
 /// guaranteed for the winning call.
-///
-/// # Examples
-///
-/// Here is a simple example providing a `Flag` that can be signalled manually
-/// when it is ready.
-///
-/// ```
-/// use futures::{
-///     future::Future,
-///     task::{AtomicWaker, Context, Poll},
-/// };
-/// use std::{
-///     pin::Pin,
-///     sync::{
-///         atomic::{AtomicBool, Ordering::Relaxed},
-///         Arc,
-///     },
-/// };
-///
-/// struct Inner {
-///     waker: AtomicWaker,
-///     set: AtomicBool,
-/// }
-///
-/// #[derive(Clone)]
-/// struct Flag(Arc<Inner>);
-///
-/// impl Flag {
-///     pub fn new() -> Self {
-///         Self(Arc::new(Inner {
-///             waker: AtomicWaker::new(),
-///             set: AtomicBool::new(false),
-///         }))
-///     }
-///
-///     pub fn signal(&self) {
-///         self.0.set.store(true, Relaxed);
-///         self.0.waker.wake();
-///     }
-/// }
-///
-/// impl Future for Flag {
-///     type Output = ();
-///
-///     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-///         // quick check to avoid registration if already done.
-///         if self.0.set.load(Relaxed) {
-///             return Poll::Ready(());
-///         }
-///
-///         self.0.waker.register(cx.waker());
-///
-///         // Need to check condition **after** `register` to avoid a race
-///         // condition that would result in lost notifications.
-///         if self.0.set.load(Relaxed) {
-///             Poll::Ready(())
-///         } else {
-///             Poll::Pending
-///         }
-///     }
-/// }
-/// ```
 pub struct AtomicWaker {
     state: AtomicUsize,
     waker: UnsafeCell<Option<Waker>>,
@@ -234,42 +172,6 @@ impl AtomicWaker {
     /// idea. Concurrent calls to `register` will attempt to register different
     /// tasks to be notified. One of the callers will win and have its task set,
     /// but there is no guarantee as to which caller will succeed.
-    ///
-    /// # Examples
-    ///
-    /// Here is how `register` is used when implementing a flag.
-    ///
-    /// ```
-    /// use futures::{
-    ///     future::Future,
-    ///     task::{AtomicWaker, Context, Poll},
-    /// };
-    /// use std::{
-    ///     pin::Pin,
-    ///     sync::atomic::{AtomicBool, Ordering::Relaxed},
-    /// };
-    ///
-    /// struct Flag {
-    ///     waker: AtomicWaker,
-    ///     set: AtomicBool,
-    /// }
-    ///
-    /// impl Future for Flag {
-    ///     type Output = ();
-    ///
-    ///     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-    ///         // Register **before** checking `set` to avoid a race condition
-    ///         // that would result in lost notifications.
-    ///         self.waker.register(cx.waker());
-    ///
-    ///         if self.set.load(Relaxed) {
-    ///             Poll::Ready(())
-    ///         } else {
-    ///             Poll::Pending
-    ///         }
-    ///     }
-    /// }
-    /// ```
     pub fn register(&self, waker: &Waker) {
         match self
             .state
