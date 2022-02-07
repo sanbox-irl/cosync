@@ -2,6 +2,7 @@ use std::{
     collections::VecDeque,
     fmt,
     future::Future,
+    marker::PhantomData,
     ops,
     pin::Pin,
     ptr::NonNull,
@@ -26,6 +27,7 @@ use crate::{
 /// You can queue a task by using [queue](Cosync::queue), by spawning a [CosyncQueueHandle]
 /// and calling [queue](CosyncQueueHandle::queue), or, within a task, calling
 /// [queue_task](CosyncInput::queue) on [CosyncInput].
+#[derive(Debug)]
 pub struct Cosync<T> {
     pool: FuturesUnordered<FutureObject>,
     incoming: Arc<Mutex<VecDeque<FutureObject>>>,
@@ -33,15 +35,63 @@ pub struct Cosync<T> {
     kill_box: Arc<()>,
 }
 
-// /// A handle to spawn tasks.
-// ///
-// /// # Examples
-// /// ```
-// /// todo!()
-// /// ```
-// ///
-// #[derive(Debug)]
-// pub struct CosyncQueueHandle(Arc<Mutex<VecDeque<IncomingObject>>>);
+/// A handle to spawn tasks.
+///
+/// # Examples
+/// ```
+/// # use cosync::Cosync;
+/// let mut cosync = Cosync::new();
+/// let handler = cosync.create_queue_handle();
+///
+/// // make a thread and join it...
+/// std::thread::spawn(move || {
+///     handler.queue_task(|mut input| async move {
+///         *input.get() = 20;
+///     });
+/// })
+/// .join()
+/// .unwrap();
+///
+/// let mut value = 1;
+/// cosync.run_blocking(&mut value);
+/// assert_eq!(value, 20);
+/// ```
+#[derive(Debug)]
+pub struct CosyncQueueHandle<T> {
+    heap_ptr: *const Option<NonNull<T>>,
+    incoming: Arc<Mutex<VecDeque<FutureObject>>>,
+    kill_box: Weak<()>,
+}
+
+impl<T: 'static> CosyncQueueHandle<T> {
+    /// Adds a new Task to the TaskQueue.
+    pub fn queue_task<Task, Out>(&self, task: Task)
+    where
+        Task: FnOnce(CosyncInput<T>) -> Out + Send + 'static,
+        Out: Future<Output = ()> + Send,
+    {
+        queue_task(task, self.kill_box.clone(), self.heap_ptr, &self.incoming);
+    }
+}
+
+// safety:
+// we guarantee with a kill counter that the main `.get` of CosyncInput
+// never dereferences invalid data, and it's only made in the same thread
+// as Cosync, so we should never have a problem with multithreaded access
+// at the same time.
+#[allow(clippy::non_send_fields_in_send_ty)]
+unsafe impl<T> Send for CosyncQueueHandle<T> {}
+unsafe impl<T> Sync for CosyncQueueHandle<T> {}
+
+impl<T> Clone for CosyncQueueHandle<T> {
+    fn clone(&self) -> Self {
+        Self {
+            heap_ptr: self.heap_ptr,
+            incoming: self.incoming.clone(),
+            kill_box: self.kill_box.clone(),
+        }
+    }
+}
 
 /// Guarded Input.
 ///
@@ -49,37 +99,37 @@ pub struct Cosync<T> {
 ///
 /// [queue]: Self::queue
 /// [get]: Self::get
-pub struct CosyncInput<T> {
-    heap_ptr: *const Option<NonNull<T>>,
-    incoming: Arc<Mutex<VecDeque<FutureObject>>>,
-    kill_box: Weak<()>,
-}
+#[derive(Debug)]
+pub struct CosyncInput<T>(CosyncQueueHandle<T>);
 
 impl<T: 'static> CosyncInput<T> {
     /// Gets the underlying [CosyncInputGuard].
     pub fn get(&mut self) -> CosyncInputGuard<'_, T> {
         // if you find this guard, it means that you somehow moved the `CosyncInput` out of
         // the closure, and then dropped the `Cosync`. Why would you do that? Don't do that.
-        assert!(Weak::strong_count(&self.kill_box) == 1, "cosync was dropped improperly");
+        assert!(
+            Weak::strong_count(&self.0.kill_box) == 1,
+            "cosync was dropped improperly"
+        );
 
         // we can always dereference this data, as we maintain
         // that it's always present.
         let o = unsafe {
-            (&*self.heap_ptr)
+            (&*self.0.heap_ptr)
                 .expect("cosync was not initialized this run correctly")
                 .as_mut()
         };
 
-        CosyncInputGuard(o)
+        CosyncInputGuard(o, PhantomData)
     }
 
     /// Queues a new task. This goes to the back of queue.
-    pub fn queue<Task, Out>(&mut self, task: Task)
+    pub fn queue<Task, Out>(&self, task: Task)
     where
         Task: Fn(CosyncInput<T>) -> Out + Send + 'static,
         Out: Future<Output = ()> + Send,
     {
-        queue_task(task, self.kill_box.clone(), self.heap_ptr, &self.incoming)
+        self.0.queue_task(task)
     }
 }
 
@@ -91,20 +141,11 @@ impl<T: 'static> CosyncInput<T> {
 unsafe impl<T> Send for CosyncInput<T> {}
 unsafe impl<T> Sync for CosyncInput<T> {}
 
-impl<T> fmt::Debug for CosyncInput<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("CosyncInput")
-            .field(&self.heap_ptr)
-            .field(&"IncomingQueue")
-            .finish()
-    }
-}
-
 /// A guarded pointer.
 ///
 /// This exists to prevent holding onto the `CosyncInputGuard` over `.await` calls. It will need to
 /// be fetched again from [CosyncInput] after awaits.
-pub struct CosyncInputGuard<'a, T>(&'a mut T);
+pub struct CosyncInputGuard<'a, T>(&'a mut T, PhantomData<*const u8>);
 
 impl<'a, T> ops::Deref for CosyncInputGuard<'a, T> {
     type Target = T;
@@ -121,7 +162,7 @@ impl<'a, T> ops::DerefMut for CosyncInputGuard<'a, T> {
 }
 
 impl<T: 'static> Cosync<T> {
-    /// Create a new, empty pool of tasks.
+    /// Create a new, empty queue of tasks.
     pub fn new() -> Self {
         Self {
             pool: FuturesUnordered::new(),
@@ -131,21 +172,32 @@ impl<T: 'static> Cosync<T> {
         }
     }
 
+    /// Creates a queue handle which can be used to spawn tasks.
+    pub fn create_queue_handle(&self) -> CosyncQueueHandle<T> {
+        let heap_ptr = &*self.data as *const Option<_>;
+
+        CosyncQueueHandle {
+            heap_ptr,
+            incoming: self.incoming.clone(),
+            kill_box: Arc::downgrade(&self.kill_box),
+        }
+    }
+
     /// Adds a new Task to the TaskQueue.
     pub fn queue<Task, Out>(&mut self, task: Task)
     where
         Task: FnOnce(CosyncInput<T>) -> Out + Send + 'static,
         Out: Future<Output = ()> + Send,
     {
-        let position = &*self.data as *const Option<_>;
+        let queue_handle = self.create_queue_handle();
 
-        queue_task(task, Arc::downgrade(&self.kill_box), position, &self.incoming);
+        queue_handle.queue_task(task)
     }
 
     /// Run all tasks in the pool to completion.
     ///
     /// ```
-    /// use cosync::Cosync;
+    /// # use cosync::Cosync;
     ///
     /// let mut cosync: Cosync<i32> = Cosync::new();
     /// cosync.queue(move |mut input| async move {
@@ -168,7 +220,7 @@ impl<T: 'static> Cosync<T> {
 
         run_executor(|cx| self.poll_pool(cx));
 
-        // for segfault help, we null here
+        // we null out here so we don't do bad things
         *self.data = None;
     }
 
@@ -260,6 +312,12 @@ impl Future for FutureObject {
     }
 }
 
+impl fmt::Debug for FutureObject {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FutureObject").finish()
+    }
+}
+
 thread_local! {
     static CURRENT_THREAD_NOTIFY: Arc<ThreadNotify> = Arc::new(ThreadNotify {
         thread: thread::current(),
@@ -326,11 +384,11 @@ fn queue_task<T: 'static, Task, Out>(
 {
     // force the future to move...
     let task = task;
-    let sec = CosyncInput {
+    let sec = CosyncInput(CosyncQueueHandle {
         heap_ptr,
         incoming: incoming.clone(),
         kill_box,
-    };
+    });
 
     let our_cb = Box::pin(async move {
         task(sec).await;
@@ -382,196 +440,200 @@ impl Future for SleepForTick {
 mod tests {
     use super::*;
 
-    #[test]
-    fn ordering() {
-        let mut cosync = Cosync::new();
+    static_assertions::assert_not_impl_all!(CosyncInputGuard<i32>: Send);
 
-        let mut value = 0;
-        cosync.queue(|_i| async move {
-            println!("actual task body!");
-        });
-        cosync.run_until_stalled(&mut value);
-    }
-
-    #[test]
-    fn pool_is_sequential() {
-        // notice that value is declared here
-        let mut value;
-
-        let mut executor: Cosync<i32> = Cosync::new();
-        executor.queue(move |mut input| async move {
-            let mut input = input.get();
-
-            assert_eq!(*input, 10);
-            *input = 10;
-        });
-
-        executor.queue(move |mut input| async move {
-            assert_eq!(*input.get(), 10);
-
-            // this will make the executor sleep, stall,
-            // and exit out of this tick
-            // we call `run_until_stalled` an additional time,
-            // so we'll complete this 1 tick sleep.
-            let sleep = SleepForTick(1);
-            sleep.await;
-
-            let input = &mut *input.get();
-            assert_eq!(*input, 30);
-            *input = 0;
-        });
-
-        // initialized here, after tasks are made
-        // (so code is correctly being deferred)
-        value = 10;
-        executor.run_until_stalled(&mut value);
-        value = 30;
-        executor.run_until_stalled(&mut value);
-        assert_eq!(value, 0);
-    }
-
-    #[test]
-    fn run_until_stalled_stalls() {
-        let mut cosync = Cosync::new();
-
-        cosync.queue(move |mut input| async move {
-            *input.get() = 10;
-            // this will make the executor stall for a call
-            // we call `run_until_stalled` an additional time,
-            // so we'll complete this 1 tick sleep.
-            sleep_ticks(1).await;
-
-            *input.get() = 20;
-        });
-
-        let mut value = 0;
-        cosync.run_until_stalled(&mut value);
-        assert_eq!(value, 10);
-        cosync.run_until_stalled(&mut value);
-        assert_eq!(value, 20);
-    }
-
-    #[test]
-    fn pool_remains_sequential() {
-        // notice that value is declared here
-        let mut value;
-
-        let mut executor: Cosync<i32> = Cosync::new();
-        executor.queue(move |mut input| async move {
-            println!("starting task 1");
-            *input.get() = 10;
-
-            sleep_ticks(100).await;
-
-            *input.get() = 20;
-        });
-
-        executor.queue(move |mut input| async move {
-            assert_eq!(*input.get(), 20);
-        });
-
-        value = 0;
-        executor.run_until_stalled(&mut value);
-    }
-
-    #[test]
-    fn pool_is_still_sequential() {
-        // notice that value is declared here
-        let mut value;
-
-        let mut executor: Cosync<i32> = Cosync::new();
-        executor.queue(move |mut input| async move {
-            println!("starting task 1");
-            *input.get() = 10;
-
-            input.queue(move |mut input| async move {
-                println!("starting task 3");
-                assert_eq!(*input.get(), 20);
-
-                *input.get() = 30;
-            });
-        });
-
-        executor.queue(move |mut input| async move {
-            println!("starting task 2");
-            *input.get() = 20;
-        });
-
-        // initialized here, after tasks are made
-        // (so code is correctly being deferred)
-        value = 0;
-        executor.run_until_stalled(&mut value);
-        assert_eq!(value, 30);
-    }
-
-    #[test]
-    fn cosync_can_be_moved() {
-        // notice that value is declared here
-        let mut value;
-
-        let mut executor: Cosync<i32> = Cosync::new();
-        executor.queue(move |mut input| async move {
-            println!("starting task 1");
-            *input.get() = 10;
-
-            sleep_ticks(1).await;
-
-            *input.get() = 20;
-        });
-
-        // initialized here, after tasks are made
-        // (so code is correctly being deferred)
-        value = 0;
-        executor.run_until_stalled(&mut value);
-        assert_eq!(value, 10);
-
-        // move it somewhere else..
-        let mut executor = Box::new(executor);
-        executor.run_until_stalled(&mut value);
-
-        assert_eq!(value, 20);
-    }
-
-    #[test]
-    #[should_panic(expected = "cosync was dropped improperly")]
-    fn ub_on_move_is_prevented() {
-        let (sndr, rx) = std::sync::mpsc::channel();
-        let mut executor: Cosync<i32> = Cosync::new();
-
-        executor.queue(move |input| async move {
-            let sndr: std::sync::mpsc::Sender<_> = sndr;
-            sndr.send(input).unwrap();
-        });
-
-        let mut value = 0;
-        executor.run_blocking(&mut value);
-        drop(executor);
-
-        // the executor was dropped. whoopsie!
-        let mut v = rx.recv().unwrap();
-        *v.get() = 20;
-    }
-
-    // THIS SHOULD NOT COMPILE!!
     // #[test]
-    // fn do_not_hold_ctx_through_await() {
-    //     let mut executor: SingleExecutor<i32> = SingleExecutor::new();
-    //     executor.add_task(move |mut input| async move {
-    //         let inner_input = input.as_ref_mut();
-    //         let inner_inner_input: &mut i32 = &mut inner_input;
-    //         assert_eq!(*inner_inner_input, 10);
+    // fn ordering() {
+    //     let mut cosync = Cosync::new();
 
+    //     let mut value = 0;
+    //     cosync.queue(|_i| async move {
+    //         println!("actual task body!");
+    //     });
+    //     cosync.run_until_stalled(&mut value);
+    // }
+
+    // #[test]
+    // fn pool_is_sequential() {
+    //     // notice that value is declared here
+    //     let mut value;
+
+    //     let mut executor: Cosync<i32> = Cosync::new();
+    //     executor.queue(move |mut input| async move {
+    //         let mut input = input.get();
+
+    //         assert_eq!(*input, 10);
+    //         *input = 10;
+    //     });
+
+    //     executor.queue(move |mut input| async move {
+    //         assert_eq!(*input.get(), 10);
+
+    //         // this will make the executor sleep, stall,
+    //         // and exit out of this tick
+    //         // we call `run_until_stalled` an additional time,
+    //         // so we'll complete this 1 tick sleep.
     //         let sleep = SleepForTick(1);
     //         sleep.await;
 
-    //         let input = inner_inner_input;
-
-    //         assert_eq!(*input, 100);
+    //         let input = &mut *input.get();
+    //         assert_eq!(*input, 30);
+    //         *input = 0;
     //     });
 
-    //     let mut one_value = 10;
-    //     executor.run_until_stalled(&mut one_value);
-    //     let mut two_value = 100;
-    //     executor.run_until_stalled(&mut two_value);
+    //     // initialized here, after tasks are made
+    //     // (so code is correctly being deferred)
+    //     value = 10;
+    //     executor.run_until_stalled(&mut value);
+    //     value = 30;
+    //     executor.run_until_stalled(&mut value);
+    //     assert_eq!(value, 0);
     // }
+
+    // #[test]
+    // fn run_until_stalled_stalls() {
+    //     let mut cosync = Cosync::new();
+
+    //     cosync.queue(move |mut input| async move {
+    //         *input.get() = 10;
+    //         // this will make the executor stall for a call
+    //         // we call `run_until_stalled` an additional time,
+    //         // so we'll complete this 1 tick sleep.
+    //         sleep_ticks(1).await;
+
+    //         *input.get() = 20;
+    //     });
+
+    //     let mut value = 0;
+    //     cosync.run_until_stalled(&mut value);
+    //     assert_eq!(value, 10);
+    //     cosync.run_until_stalled(&mut value);
+    //     assert_eq!(value, 20);
+    // }
+
+    // #[test]
+    // fn pool_remains_sequential() {
+    //     // notice that value is declared here
+    //     let mut value;
+
+    //     let mut executor: Cosync<i32> = Cosync::new();
+    //     executor.queue(move |mut input| async move {
+    //         println!("starting task 1");
+    //         *input.get() = 10;
+
+    //         sleep_ticks(100).await;
+
+    //         *input.get() = 20;
+    //     });
+
+    //     executor.queue(move |mut input| async move {
+    //         assert_eq!(*input.get(), 20);
+    //     });
+
+    //     value = 0;
+    //     executor.run_until_stalled(&mut value);
+    // }
+
+    // #[test]
+    // fn pool_is_still_sequential() {
+    //     // notice that value is declared here
+    //     let mut value;
+
+    //     let mut executor: Cosync<i32> = Cosync::new();
+    //     executor.queue(move |mut input| async move {
+    //         println!("starting task 1");
+    //         *input.get() = 10;
+
+    //         input.queue(move |mut input| async move {
+    //             println!("starting task 3");
+    //             assert_eq!(*input.get(), 20);
+
+    //             *input.get() = 30;
+    //         });
+    //     });
+
+    //     executor.queue(move |mut input| async move {
+    //         println!("starting task 2");
+    //         *input.get() = 20;
+    //     });
+
+    //     // initialized here, after tasks are made
+    //     // (so code is correctly being deferred)
+    //     value = 0;
+    //     executor.run_until_stalled(&mut value);
+    //     assert_eq!(value, 30);
+    // }
+
+    // #[test]
+    // fn cosync_can_be_moved() {
+    //     // notice that value is declared here
+    //     let mut value;
+
+    //     let mut executor: Cosync<i32> = Cosync::new();
+    //     executor.queue(move |mut input| async move {
+    //         println!("starting task 1");
+    //         *input.get() = 10;
+
+    //         sleep_ticks(1).await;
+
+    //         *input.get() = 20;
+    //     });
+
+    //     // initialized here, after tasks are made
+    //     // (so code is correctly being deferred)
+    //     value = 0;
+    //     executor.run_until_stalled(&mut value);
+    //     assert_eq!(value, 10);
+
+    //     // move it somewhere else..
+    //     let mut executor = Box::new(executor);
+    //     executor.run_until_stalled(&mut value);
+
+    //     assert_eq!(value, 20);
+    // }
+
+    // #[test]
+    // #[should_panic(expected = "cosync was dropped improperly")]
+    // fn ub_on_move_is_prevented() {
+    //     let (sndr, rx) = std::sync::mpsc::channel();
+    //     let mut executor: Cosync<i32> = Cosync::new();
+
+    //     executor.queue(move |input| async move {
+    //         let sndr: std::sync::mpsc::Sender<_> = sndr;
+    //         sndr.send(input).unwrap();
+    //     });
+
+    //     let mut value = 0;
+    //     executor.run_blocking(&mut value);
+    //     drop(executor);
+
+    //     // the executor was dropped. whoopsie!
+    //     let mut v = rx.recv().unwrap();
+    //     *v.get() = 20;
+    // }
+
+    // #[test]
+    // fn threading() {
+    //     let mut cosync = Cosync::new();
+    //     let handler = cosync.create_queue_handle();
+
+    //     // make a thread and join it...
+    //     std::thread::spawn(move || {
+    //         handler.queue_task(|mut input| async move {
+    //             *input.get() = 20;
+    //         });
+    //     })
+    //     .join()
+    //     .unwrap();
+
+    //     let mut value = 1;
+    //     cosync.run_blocking(&mut value);
+    //     assert_eq!(value, 20);
+    // }
+
+    #[test]
+    fn trybuild() {
+        let t = trybuild::TestCases::new();
+        t.compile_fail("tests/try_build/*.rs");
+    }
 }
