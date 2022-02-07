@@ -41,130 +41,6 @@ pub struct Cosync<T> {
     kill_box: Arc<()>,
 }
 
-/// A handle to spawn tasks.
-///
-/// # Examples
-/// ```
-/// # use cosync::Cosync;
-/// let mut cosync = Cosync::new();
-/// let handler = cosync.create_queue_handle();
-///
-/// // make a thread and join it...
-/// std::thread::spawn(move || {
-///     handler.queue(|mut input| async move {
-///         *input.get() = 20;
-///     });
-/// })
-/// .join()
-/// .unwrap();
-///
-/// let mut value = 1;
-/// cosync.run_blocking(&mut value);
-/// assert_eq!(value, 20);
-/// ```
-#[derive(Debug)]
-pub struct CosyncQueueHandle<T> {
-    heap_ptr: *const Option<NonNull<T>>,
-    incoming: Arc<Mutex<VecDeque<FutureObject>>>,
-    kill_box: Weak<()>,
-}
-
-impl<T: 'static> CosyncQueueHandle<T> {
-    /// Adds a new Task to the TaskQueue.
-    pub fn queue<Task, Out>(&self, task: Task)
-    where
-        Task: FnOnce(CosyncInput<T>) -> Out + Send + 'static,
-        Out: Future<Output = ()> + Send,
-    {
-        queue_task(task, self.kill_box.clone(), self.heap_ptr, &self.incoming);
-    }
-}
-
-// safety:
-// we guarantee with a kill counter that the main `.get` of CosyncInput
-// never dereferences invalid data, and it's only made in the same thread
-// as Cosync, so we should never have a problem with multithreaded access
-// at the same time.
-#[allow(clippy::non_send_fields_in_send_ty)]
-unsafe impl<T> Send for CosyncQueueHandle<T> {}
-unsafe impl<T> Sync for CosyncQueueHandle<T> {}
-
-impl<T> Clone for CosyncQueueHandle<T> {
-    fn clone(&self) -> Self {
-        Self {
-            heap_ptr: self.heap_ptr,
-            incoming: self.incoming.clone(),
-            kill_box: self.kill_box.clone(),
-        }
-    }
-}
-
-/// A guarded pointer to create a [CosyncInputGuard] by [get] and to queue more tasks by [queue]
-///
-/// [queue]: Self::queue
-/// [get]: Self::get
-#[derive(Debug)]
-pub struct CosyncInput<T>(CosyncQueueHandle<T>);
-
-impl<T: 'static> CosyncInput<T> {
-    /// Gets the underlying [CosyncInputGuard].
-    pub fn get(&mut self) -> CosyncInputGuard<'_, T> {
-        // if you find this guard, it means that you somehow moved the `CosyncInput` out of
-        // the closure, and then dropped the `Cosync`. Why would you do that? Don't do that.
-        assert!(
-            Weak::strong_count(&self.0.kill_box) == 1,
-            "cosync was dropped improperly"
-        );
-
-        // we can always dereference this data, as we maintain
-        // that it's always present.
-        let o = unsafe {
-            (&*self.0.heap_ptr)
-                .expect("cosync was not initialized this run correctly")
-                .as_mut()
-        };
-
-        CosyncInputGuard(o, PhantomData)
-    }
-
-    /// Queues a new task. This goes to the back of queue.
-    pub fn queue<Task, Out>(&self, task: Task)
-    where
-        Task: Fn(CosyncInput<T>) -> Out + Send + 'static,
-        Out: Future<Output = ()> + Send,
-    {
-        self.0.queue(task)
-    }
-}
-
-// safety:
-// we create `CosyncInput` per task, and it doesn't escape our closure.
-// therefore, it's `*const` field should only be accessible when we know
-// it's valid.
-#[allow(clippy::non_send_fields_in_send_ty)]
-unsafe impl<T> Send for CosyncInput<T> {}
-unsafe impl<T> Sync for CosyncInput<T> {}
-
-/// A guarded pointer.
-///
-/// This exists to prevent holding onto the `CosyncInputGuard` over `.await` calls. It will need to
-/// be fetched again from [CosyncInput] after awaits.
-pub struct CosyncInputGuard<'a, T>(&'a mut T, PhantomData<*const u8>);
-
-impl<'a, T> ops::Deref for CosyncInputGuard<'a, T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        self.0
-    }
-}
-
-impl<'a, T> ops::DerefMut for CosyncInputGuard<'a, T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.0
-    }
-}
-
 impl<T: 'static> Cosync<T> {
     /// Create a new, empty queue of tasks.
     pub fn new() -> Self {
@@ -174,6 +50,28 @@ impl<T: 'static> Cosync<T> {
             data: Box::new(None),
             kill_box: Arc::new(()),
         }
+    }
+
+    /// Returns the number of tasks queued. This *includes* the task currently being executed. Use
+    /// [is_executing] to see if there is a task currently being executed (ie, it returned `Pending`
+    /// at some point in its execution).
+    ///
+    /// [is_executing]: Self::is_executing
+    pub fn len(&self) -> usize {
+        let one = if self.is_executing() { 1 } else { 0 };
+
+        one + self.incoming.lock().unwrap().len()
+    }
+
+    /// Returns true if no futures are being executed *and* there are no futures in the queue.
+    pub fn is_empty(&self) -> bool {
+        !self.is_executing() && self.incoming.lock().unwrap().is_empty()
+    }
+
+    /// Returns true if `cosync` has a `Pending` future. It is possible for
+    /// the `cosync` to have no `Pending` future, but to have tasks queued still.
+    pub fn is_executing(&self) -> bool {
+        !self.pool.is_empty()
     }
 
     /// Creates a queue handle which can be used to spawn tasks.
@@ -298,6 +196,130 @@ impl<T: 'static> Cosync<T> {
 
         // try to execute the next ready future
         Pin::new(&mut self.pool).poll_next(cx)
+    }
+}
+
+/// A handle to spawn tasks.
+///
+/// # Examples
+/// ```
+/// # use cosync::Cosync;
+/// let mut cosync = Cosync::new();
+/// let handler = cosync.create_queue_handle();
+///
+/// // make a thread and join it...
+/// std::thread::spawn(move || {
+///     handler.queue(|mut input| async move {
+///         *input.get() = 20;
+///     });
+/// })
+/// .join()
+/// .unwrap();
+///
+/// let mut value = 1;
+/// cosync.run_blocking(&mut value);
+/// assert_eq!(value, 20);
+/// ```
+#[derive(Debug)]
+pub struct CosyncQueueHandle<T> {
+    heap_ptr: *const Option<NonNull<T>>,
+    incoming: Arc<Mutex<VecDeque<FutureObject>>>,
+    kill_box: Weak<()>,
+}
+
+impl<T: 'static> CosyncQueueHandle<T> {
+    /// Adds a new Task to the TaskQueue.
+    pub fn queue<Task, Out>(&self, task: Task)
+    where
+        Task: FnOnce(CosyncInput<T>) -> Out + Send + 'static,
+        Out: Future<Output = ()> + Send,
+    {
+        queue_task(task, self.kill_box.clone(), self.heap_ptr, &self.incoming);
+    }
+}
+
+// safety:
+// we guarantee with a kill counter that the main `.get` of CosyncInput
+// never dereferences invalid data, and it's only made in the same thread
+// as Cosync, so we should never have a problem with multithreaded access
+// at the same time.
+#[allow(clippy::non_send_fields_in_send_ty)]
+unsafe impl<T> Send for CosyncQueueHandle<T> {}
+unsafe impl<T> Sync for CosyncQueueHandle<T> {}
+
+impl<T> Clone for CosyncQueueHandle<T> {
+    fn clone(&self) -> Self {
+        Self {
+            heap_ptr: self.heap_ptr,
+            incoming: self.incoming.clone(),
+            kill_box: self.kill_box.clone(),
+        }
+    }
+}
+
+/// A guarded pointer to create a [CosyncInputGuard] by [get] and to queue more tasks by [queue]
+///
+/// [queue]: Self::queue
+/// [get]: Self::get
+#[derive(Debug)]
+pub struct CosyncInput<T>(CosyncQueueHandle<T>);
+
+impl<T: 'static> CosyncInput<T> {
+    /// Gets the underlying [CosyncInputGuard].
+    pub fn get(&mut self) -> CosyncInputGuard<'_, T> {
+        // if you find this guard, it means that you somehow moved the `CosyncInput` out of
+        // the closure, and then dropped the `Cosync`. Why would you do that? Don't do that.
+        assert!(
+            Weak::strong_count(&self.0.kill_box) == 1,
+            "cosync was dropped improperly"
+        );
+
+        // we can always dereference this data, as we maintain
+        // that it's always present.
+        let o = unsafe {
+            (&*self.0.heap_ptr)
+                .expect("cosync was not initialized this run correctly")
+                .as_mut()
+        };
+
+        CosyncInputGuard(o, PhantomData)
+    }
+
+    /// Queues a new task. This goes to the back of queue.
+    pub fn queue<Task, Out>(&self, task: Task)
+    where
+        Task: Fn(CosyncInput<T>) -> Out + Send + 'static,
+        Out: Future<Output = ()> + Send,
+    {
+        self.0.queue(task)
+    }
+}
+
+// safety:
+// we create `CosyncInput` per task, and it doesn't escape our closure.
+// therefore, it's `*const` field should only be accessible when we know
+// it's valid.
+#[allow(clippy::non_send_fields_in_send_ty)]
+unsafe impl<T> Send for CosyncInput<T> {}
+unsafe impl<T> Sync for CosyncInput<T> {}
+
+/// A guarded pointer.
+///
+/// This exists to prevent holding onto the `CosyncInputGuard` over `.await` calls. It will need to
+/// be fetched again from [CosyncInput] after awaits.
+pub struct CosyncInputGuard<'a, T>(&'a mut T, PhantomData<*const u8>);
+
+impl<'a, T> ops::Deref for CosyncInputGuard<'a, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.0
+    }
+}
+
+impl<'a, T> ops::DerefMut for CosyncInputGuard<'a, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0
     }
 }
 
