@@ -2,7 +2,9 @@ mod abort;
 
 pub mod enter;
 
+mod atomic_waker;
 mod iter;
+mod arc_wake;
 pub use self::iter::{IntoIter, Iter, IterMut, IterPinMut, IterPinRef};
 
 mod futures_unordered;
@@ -16,6 +18,3 @@ use self::ready_to_run_queue::{Dequeue, ReadyToRunQueue};
 
 mod waker_ref;
 pub use waker_ref::WakerRef;
-
-mod thread_notify;
-pub(crate) use thread_notify::ThreadNotify;

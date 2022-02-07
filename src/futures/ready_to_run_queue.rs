@@ -1,4 +1,3 @@
-use futures::task::AtomicWaker;
 use std::{
     cell::UnsafeCell,
     ptr,
@@ -11,7 +10,7 @@ use std::{
     },
 };
 
-use super::{abort::abort, task::Task};
+use super::{abort::abort, atomic_waker::AtomicWaker, task::Task};
 
 pub(super) enum Dequeue<Fut> {
     Data(*const Task<Fut>),

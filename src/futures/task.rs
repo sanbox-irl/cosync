@@ -1,5 +1,5 @@
-use super::{abort::abort, ReadyToRunQueue};
-use futures::task::{waker_ref, ArcWake, WakerRef};
+use super::{abort::abort, arc_wake::ArcWake, ReadyToRunQueue, WakerRef};
+// use futures::task::{waker_ref, ArcWake, WakerRef};
 use std::{
     cell::UnsafeCell,
     sync::{
@@ -76,7 +76,7 @@ impl<Fut> ArcWake for Task<Fut> {
 impl<Fut> Task<Fut> {
     /// Returns a waker reference for this task without cloning the Arc.
     pub(super) fn waker_ref(this: &Arc<Self>) -> WakerRef<'_> {
-        waker_ref(this)
+        crate::futures::waker_ref::waker_ref(this)
     }
 
     /// Spins until `next_all` is no longer set to `pending_next_all`.
@@ -90,11 +90,7 @@ impl<Fut> Task<Fut> {
     /// `Relaxed` or `Acquire` ordering can be used. `Acquire` ordering must be
     /// used before `len_all` can be safely read.
     #[inline]
-    pub(super) fn spin_next_all(
-        &self,
-        pending_next_all: *mut Self,
-        ordering: Ordering,
-    ) -> *const Self {
+    pub(super) fn spin_next_all(&self, pending_next_all: *mut Self, ordering: Ordering) -> *const Self {
         loop {
             let next = self.next_all.load(ordering);
             if next != pending_next_all {

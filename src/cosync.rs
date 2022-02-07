@@ -13,7 +13,10 @@ use std::{
     thread,
 };
 
-use crate::futures::{enter::enter, FuturesUnordered, ThreadNotify};
+use crate::{
+    futures::{enter::enter, FuturesUnordered},
+    thread_notify::ThreadNotify,
+};
 
 /// A single-threaded task pool for polling futures to completion.
 ///
@@ -264,7 +267,7 @@ where
     );
 
     CURRENT_THREAD_NOTIFY.with(|thread_notify| {
-        let waker = thread_notify.waker_ref();
+        let waker = futures::task::waker_ref(thread_notify);
         let mut cx = Context::from_waker(&waker);
         loop {
             if let Poll::Ready(t) = work_on_future(&mut cx) {
@@ -293,7 +296,7 @@ fn poll_executor<T, F: FnMut(&mut Context<'_>) -> T>(mut f: F) -> T {
     );
 
     CURRENT_THREAD_NOTIFY.with(|thread_notify| {
-        let waker = thread_notify.waker_ref();
+        let waker = futures::task::waker_ref(thread_notify);
         let mut cx = Context::from_waker(&waker);
         f(&mut cx)
     })
