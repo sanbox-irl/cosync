@@ -6,7 +6,7 @@ use std::{
     thread::Thread,
 };
 
-use futures::task::ArcWake;
+use crate::futures::arc_wake::ArcWake;
 
 pub(crate) struct ThreadNotify {
     /// The (single) executor thread.

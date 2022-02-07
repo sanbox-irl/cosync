@@ -14,7 +14,7 @@ use std::{
 };
 
 use crate::{
-    futures::{enter::enter, FuturesUnordered},
+    futures::{enter::enter, waker_ref, FuturesUnordered},
     thread_notify::ThreadNotify,
 };
 
@@ -267,7 +267,7 @@ where
     );
 
     CURRENT_THREAD_NOTIFY.with(|thread_notify| {
-        let waker = futures::task::waker_ref(thread_notify);
+        let waker = waker_ref::waker_ref(thread_notify);
         let mut cx = Context::from_waker(&waker);
         loop {
             if let Poll::Ready(t) = work_on_future(&mut cx) {
@@ -296,7 +296,7 @@ fn poll_executor<T, F: FnMut(&mut Context<'_>) -> T>(mut f: F) -> T {
     );
 
     CURRENT_THREAD_NOTIFY.with(|thread_notify| {
-        let waker = futures::task::waker_ref(thread_notify);
+        let waker = waker_ref::waker_ref(thread_notify);
         let mut cx = Context::from_waker(&waker);
         f(&mut cx)
     })
