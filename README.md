@@ -4,9 +4,7 @@
 ![Crates.io](https://img.shields.io/crates/v/cosync)
 ![Crates.io](https://img.shields.io/crates/l/cosync)
 
-This crate provides a single threaded, sequential, parameterized async runtime.
-In other words, this creates *coroutines*, specifically targetting video game logic,
-though it's suitable for creating any sequences of directions which take time.
+This crate provides a single-threaded, sequential, parameterized async runtime. In other words, this creates *coroutines*, specifically targeting video game logic, though `cosync` is suitable for creating any sequences of directions which take time.
 
 Here's a basic `Cosync` example:
 
@@ -33,20 +31,10 @@ fn main() {
 }
 ```
 
-`Cosync` is **not** multithreaded, nor parallel -- it works entirely sequentially. Think of it as a useful way of expressing code that is multistaged and takes *time* to complete. Moving cameras, staging actors, and performing animations often work well with `Cosync`. Loading asset files, doing mathematical computations, or doing IO should be done by more easily multithreaded runtimes.
+`Cosync` is **not** multithreaded, nor parallel -- it works entirely sequentially. Think of it as a useful way of expressing code that is multistaged and takes *time* to complete, that you want to do *later*. Moving cameras, staging actors, and performing animations often work well with `Cosync`. Loading asset files, doing mathematical computations, or doing IO should be done by more easily multithreaded runtimes such as [switchyard](https://github.com/BVE-Reborn/switchyard).
 
-This crate exposes two methods for driving the runtime: `run_until_stall`
-and `run_blocking`. You generally want `run_until_stall`, which attempts to do
-the task given, until it cannot (ie, is waiting), at which point is returns
-control to the caller.
+This crate exposes two methods for driving the runtime: `run_until_stall` and `run_blocking`. You generally want `run_until_stall`, which attempts process as much of the queue as it can, until it cannot (ie, a future returns `Poll::Pending`), at which point control is returned to the caller.
 
-Finally, this crate supports sending tasks from other threads. There are three ways
-to make new tasks. First, the `Cosync` struct itself has a `queue` method on it. Secondly,
-each task gets a `CosyncInput<T>` as a parameter, which has `get` (to get access to your `&mut
-T`) and `queue` to queue another task (which is at the end of the queue, not necessarily after
-the task which added it). Lastly, you can create a `CosyncQueueHandle` with
-`Cosync::create_queue_handle` which is `Send` and can be given to other threads to create new
-tasks for the `Cosync`.
+There are three ways to make new tasks. First, the `Cosync` struct itself has a `queue` method on it. Secondly, each task gets a `CosyncInput<T>` as a parameter, which has `get` (to get access to your `&mut T`) and `queue` to queue another task (which is at the end of the queue, not necessarily after the task which added it). Lastly, you can create a `CosyncQueueHandle` with `Cosync::create_queue_handle` which is `Send` and can be given to other threads to create new tasks for the `Cosync`.
 
-This crate depends on only `std`. It is in an early state of development, but is in
-production ready state right now.
+This crate depends on only `std`. It is in an early state of development, but is in production ready state right now.
