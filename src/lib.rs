@@ -1,45 +1,7 @@
-//! This crate provides a singlethreaded, sequential, parameterized async runtime.
-//! In other words, this creates *coroutines*, specifically targetting video game logic,
-//! though it's suitable for creating any sequences of directions which take time.
-//!
-//! Here's a basic `Cosync` example:
-//!
-//! ```
-//! # use cosync::{Cosync, CosyncInput};
-//! // the type parameter is the *value* which other functions will get.
-//! let mut cosync: Cosync<i32> = Cosync::new();
-//!
-//! let example_move = 20;
-//!
-//! // there are a few ways to queue tasks, but here's a simple one:
-//! cosync.queue(move |mut input: CosyncInput<i32>| async move {
-//!     // set our input to `example_move`...
-//!     *input.get() = example_move;
-//! });
-//!
-//! let mut value = 0;
-//! cosync.run_until_stall(&mut value);
-//! assert_eq!(value, example_move);
-//! ```
-//!
-//! This crate exposes two methods for driving the runtime: `run_until_stall`
-//! and `run_blocking`. You generally want `run_until_stall`, which attempts to do
-//! the task given, until it cannot (ie, is waiting), at which point is returns
-//! control to the caller.
-//!
-//! Finally, this crate supports sending tasks from other threads. There are three ways
-//! to make new tasks. First, the `Cosync` struct itself has a `queue` method on it. Secondly,
-//! each task gets a `CosyncInput<T>` as a parameter, which has `get` (to get access to your `&mut
-//! T`) and `queue` to queue another task (which is at the end of the queue, not necessarily after
-//! the task which added it). Lastly, you can create a `CosyncQueueHandle` with
-//! `Cosync::create_queue_handle` which is `Send` and can be given to other threads to create new
-//! tasks for the `Cosync`.
-//!
-//! This crate depends on only `std`. It is in an early state of development, but is in
-//! production ready state right now
-
+#![doc = include_str!("../README.md")]
 #![deny(rust_2018_idioms)]
 #![deny(missing_docs)]
+#![deny(rustdoc::missing_doc_code_examples)]
 
 // this is vendored code from the `futures-rs` crate, to avoid
 // having a huge dependency when we only need a little bit
@@ -65,10 +27,11 @@ use futures::arc_wake::ArcWake;
 
 use crate::futures::{enter::enter, waker_ref, FuturesUnordered};
 
-/// A single-threaded task pool for polling futures to completion.
+/// A single-threaded, sequential, parameterized async task queue.
 ///
 /// This executor allows you to queue multiple tasks in sequence, and to
-/// queue tasks within other tasks.
+/// queue tasks within other tasks. Tasks are done in the order they
+/// are queued.
 ///
 /// You can queue a task by using [queue](Cosync::queue), by spawning a [CosyncQueueHandle]
 /// and calling [queue](CosyncQueueHandle::queue), or, within a task, calling
@@ -111,7 +74,7 @@ pub struct CosyncQueueHandle<T> {
 
 impl<T: 'static> CosyncQueueHandle<T> {
     /// Adds a new Task to the TaskQueue.
-    pub fn queue_task<Task, Out>(&self, task: Task)
+    pub fn queue<Task, Out>(&self, task: Task)
     where
         Task: FnOnce(CosyncInput<T>) -> Out + Send + 'static,
         Out: Future<Output = ()> + Send,
@@ -139,9 +102,7 @@ impl<T> Clone for CosyncQueueHandle<T> {
     }
 }
 
-/// Guarded Input.
-///
-/// Its primary role is to create a [CosyncInputGuard] by [get] and to queue more tasks by [queue]
+/// A guarded pointer to create a [CosyncInputGuard] by [get] and to queue more tasks by [queue]
 ///
 /// [queue]: Self::queue
 /// [get]: Self::get
@@ -175,7 +136,7 @@ impl<T: 'static> CosyncInput<T> {
         Task: Fn(CosyncInput<T>) -> Out + Send + 'static,
         Out: Future<Output = ()> + Send,
     {
-        self.0.queue_task(task)
+        self.0.queue(task)
     }
 }
 
@@ -237,7 +198,7 @@ impl<T: 'static> Cosync<T> {
     {
         let queue_handle = self.create_queue_handle();
 
-        queue_handle.queue_task(task)
+        queue_handle.queue(task)
     }
 
     /// Run all tasks in the queue to completion. You probably want `run_until_stall`.
@@ -691,7 +652,7 @@ mod tests {
 
         // make a thread and join it...
         std::thread::spawn(move || {
-            handler.queue_task(|mut input| async move {
+            handler.queue(|mut input| async move {
                 *input.get() = 20;
             });
         })

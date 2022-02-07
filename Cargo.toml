@@ -1,7 +1,12 @@
 [package]
 name = "cosync"
 version = "0.1.0"
+authors = ["Jonathan Spira <jjspira@gmail.com>"]
 edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/sanbox-irl/cosync"
+description = "a single threaded, sequential, parameterized task pool for games"
+categories = ["game-development"]
 
 [dev-dependencies]
 static_assertions = "1.1"
