@@ -1,7 +1,7 @@
 # cosync
 
 ![docs.rs](https://img.shields.io/docsrs/cosync)
-![Crates.io](https://img.shields.io/crates/d/cosync)
+![Crates.io](https://img.shields.io/crates/v/cosync)
 ![Crates.io](https://img.shields.io/crates/l/cosync)
 
 This crate provides a single threaded, sequential, parameterized async runtime.
