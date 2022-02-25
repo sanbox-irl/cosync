@@ -34,14 +34,14 @@ use std::{
 /// and calling [queue](CosyncQueueHandle::queue), or, within a task, calling
 /// [queue_task](CosyncInput::queue) on [CosyncInput].
 #[derive(Debug)]
-pub struct Cosync<T> {
+pub struct Cosync<T: ?Sized> {
     pool: FuturesUnordered<FutureObject>,
     incoming: Arc<Mutex<VecDeque<FutureObject>>>,
     data: Box<Option<NonNull<T>>>,
     kill_box: Arc<()>,
 }
 
-impl<T: 'static> Cosync<T> {
+impl<T: 'static + ?Sized> Cosync<T> {
     /// Create a new, empty queue of tasks.
     pub fn new() -> Self {
         Self {
@@ -221,13 +221,13 @@ impl<T: 'static> Cosync<T> {
 /// assert_eq!(value, 20);
 /// ```
 #[derive(Debug)]
-pub struct CosyncQueueHandle<T> {
+pub struct CosyncQueueHandle<T: ?Sized> {
     heap_ptr: *const Option<NonNull<T>>,
     incoming: Arc<Mutex<VecDeque<FutureObject>>>,
     kill_box: Weak<()>,
 }
 
-impl<T: 'static> CosyncQueueHandle<T> {
+impl<T: 'static + ?Sized> CosyncQueueHandle<T> {
     /// Adds a new Task to the TaskQueue.
     pub fn queue<Task, Out>(&self, task: Task)
     where
@@ -262,9 +262,9 @@ impl<T> Clone for CosyncQueueHandle<T> {
 /// [queue]: Self::queue
 /// [get]: Self::get
 #[derive(Debug)]
-pub struct CosyncInput<T>(CosyncQueueHandle<T>);
+pub struct CosyncInput<T: ?Sized>(CosyncQueueHandle<T>);
 
-impl<T: 'static> CosyncInput<T> {
+impl<T: 'static + ?Sized> CosyncInput<T> {
     /// Gets the underlying [CosyncInputGuard].
     pub fn get(&mut self) -> CosyncInputGuard<'_, T> {
         // if you find this guard, it means that you somehow moved the `CosyncInput` out of
@@ -300,16 +300,16 @@ impl<T: 'static> CosyncInput<T> {
 // therefore, it's `*const` field should only be accessible when we know
 // it's valid.
 #[allow(clippy::non_send_fields_in_send_ty)]
-unsafe impl<T> Send for CosyncInput<T> {}
-unsafe impl<T> Sync for CosyncInput<T> {}
+unsafe impl<T: ?Sized> Send for CosyncInput<T> {}
+unsafe impl<T: ?Sized> Sync for CosyncInput<T> {}
 
 /// A guarded pointer.
 ///
 /// This exists to prevent holding onto the `CosyncInputGuard` over `.await` calls. It will need to
 /// be fetched again from [CosyncInput] after awaits.
-pub struct CosyncInputGuard<'a, T>(&'a mut T, PhantomData<*const u8>);
+pub struct CosyncInputGuard<'a, T: ?Sized>(&'a mut T, PhantomData<*const u8>);
 
-impl<'a, T> ops::Deref for CosyncInputGuard<'a, T> {
+impl<'a, T: ?Sized> ops::Deref for CosyncInputGuard<'a, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -317,7 +317,7 @@ impl<'a, T> ops::Deref for CosyncInputGuard<'a, T> {
     }
 }
 
-impl<'a, T> ops::DerefMut for CosyncInputGuard<'a, T> {
+impl<'a, T: ?Sized> ops::DerefMut for CosyncInputGuard<'a, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.0
     }
@@ -425,7 +425,7 @@ fn poll_executor<T, F: FnMut(&mut Context<'_>) -> T>(mut f: F) -> T {
 }
 
 /// Adds a new Task to the TaskQueue.
-fn queue_task<T: 'static, Task, Out>(
+fn queue_task<T: 'static + ?Sized, Task, Out>(
     task: Task,
     kill_box: Weak<()>,
     heap_ptr: *const Option<NonNull<T>>,
@@ -506,6 +506,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::needless_late_init)]
     fn pool_is_sequential() {
         // notice that value is declared here
         let mut value;
@@ -564,6 +565,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::needless_late_init)]
     fn pool_remains_sequential() {
         // notice that value is declared here
         let mut value;
@@ -587,6 +589,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::needless_late_init)]
     fn pool_is_still_sequential() {
         // notice that value is declared here
         let mut value;
@@ -617,6 +620,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::needless_late_init)]
     fn cosync_can_be_moved() {
         // notice that value is declared here
         let mut value;
@@ -687,5 +691,53 @@ mod tests {
     fn trybuild() {
         let t = trybuild::TestCases::new();
         t.compile_fail("tests/try_build/*.rs");
+    }
+
+    #[test]
+    fn dynamic_dispatch() {
+        trait DynDispatch {
+            fn test(&self) -> i32;
+        }
+
+        impl DynDispatch for i32 {
+            fn test(&self) -> i32 {
+                *self
+            }
+        }
+
+        impl DynDispatch for &'static str {
+            fn test(&self) -> i32 {
+                self.parse().unwrap()
+            }
+        }
+
+        let mut cosync: Cosync<dyn DynDispatch> = Cosync::new();
+        cosync.queue(|mut input: CosyncInput<dyn DynDispatch>| async move {
+            {
+                let inner: &mut dyn DynDispatch = &mut *input.get();
+                assert_eq!(inner.test(), 3);
+            }
+
+            sleep_ticks(1).await;
+
+            {
+                let inner: &mut dyn DynDispatch = &mut *input.get();
+                assert_eq!(inner.test(), 3);
+            }
+        });
+
+        cosync.run_until_stall(&mut 3);
+        cosync.run_until_stall(&mut "3");
+    }
+
+    #[test]
+    fn unsized_type() {
+        let mut cosync: Cosync<str> = Cosync::new();
+
+        cosync.queue(|mut input| async move {
+            let input_guard = input.get();
+            let inner_str: &str = &input_guard;
+            println!("inner str = {}", inner_str);
+        });
     }
 }

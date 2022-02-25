@@ -6,13 +6,13 @@ error: future cannot be sent between threads safely
    |
    = help: within `impl Future<Output = [async output]>`, the trait `Send` is not implemented for `*const u8`
 note: future is not `Send` as this value is used across an await
-  --> tests/try_build/do_not_hold_ctx_through_await.rs:10:21
+  --> tests/try_build/do_not_hold_ctx_through_await.rs:10:43
    |
 7  |         let mut inner_input = input.get();
    |             --------------- has type `CosyncInputGuard<'_, i32>` which is not `Send`
 ...
 10 |         let sleep = cosync::sleep_ticks(1).await;
-   |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ await occurs here, with `mut inner_input` maybe used later
+   |                                           ^^^^^^ await occurs here, with `mut inner_input` maybe used later
 ...
 15 |     });
    |     - `mut inner_input` is later dropped here

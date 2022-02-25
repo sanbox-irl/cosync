@@ -31,6 +31,29 @@ fn main() {
 }
 ```
 
+Additionally, `Cosync` can handle unsized Ts, including dynamic dispatch:
+
+```rust
+use cosync::Cosync;
+
+// unsized type
+let mut cosync: Cosync<str> = Cosync::new();
+cosync.queue(|mut input| async move {
+    let input_guard = input.get();
+    let inner_str: &str = &input_guard;
+    println!("inner str = {}", inner_str);
+});
+
+// dynamic dispatch
+trait DynDispatch {
+    fn test(&self);
+}
+let mut cosync_dyn: Cosync<dyn DynDispatch> = Cosync::new();
+cosync_dyn.queue(|mut input| async move {
+    let inner: &mut dyn DynDispatch = &mut *input.get();
+});
+```
+
 `Cosync` is **not** multithreaded, nor parallel -- it works entirely sequentially. Think of it as a useful way of expressing code that is multistaged and takes *time* to complete, that you want to do *later*. Moving cameras, staging actors, and performing animations often work well with `Cosync`. Loading asset files, doing mathematical computations, or doing IO should be done by more easily multithreaded runtimes such as [switchyard](https://github.com/BVE-Reborn/switchyard).
 
 This crate exposes two methods for driving the runtime: `run_until_stall` and `run_blocking`. You generally want `run_until_stall`, which attempts process as much of the queue as it can, until it cannot (ie, a future returns `Poll::Pending`), at which point control is returned to the caller.
