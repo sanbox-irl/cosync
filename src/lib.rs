@@ -740,4 +740,18 @@ mod tests {
             println!("inner str = {}", inner_str);
         });
     }
+
+    #[test]
+    fn can_move_non_copy() {
+        let mut cosync: Cosync<i32> = Cosync::new();
+
+        let my_vec = vec![10];
+
+        cosync.queue(|_input| async move {
+            let mut vec = my_vec;
+            vec.push(10);
+
+            assert_eq!(*vec, [10, 10]);
+        });
+    }
 }
