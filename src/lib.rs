@@ -244,10 +244,10 @@ impl<T: 'static + ?Sized> CosyncQueueHandle<T> {
 // as Cosync, so we should never have a problem with multithreaded access
 // at the same time.
 #[allow(clippy::non_send_fields_in_send_ty)]
-unsafe impl<T> Send for CosyncQueueHandle<T> {}
-unsafe impl<T> Sync for CosyncQueueHandle<T> {}
+unsafe impl<T: ?Sized> Send for CosyncQueueHandle<T> {}
+unsafe impl<T: ?Sized> Sync for CosyncQueueHandle<T> {}
 
-impl<T> Clone for CosyncQueueHandle<T> {
+impl<T: ?Sized> Clone for CosyncQueueHandle<T> {
     fn clone(&self) -> Self {
         Self {
             heap_ptr: self.heap_ptr,
@@ -292,6 +292,11 @@ impl<T: 'static + ?Sized> CosyncInput<T> {
         Out: Future<Output = ()> + Send,
     {
         self.0.queue(task)
+    }
+
+    /// Creates a queue handle which can be used to spawn tasks.
+    pub fn create_queue_handle(&self) -> CosyncQueueHandle<T> {
+        self.0.clone()
     }
 }
 
