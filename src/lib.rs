@@ -464,6 +464,7 @@ pub fn sleep_ticks(ticks: usize) -> SleepForTick {
 }
 
 /// A helper struct which registers a sleep for a given number of ticks.
+#[must_use = "futures do nothing unless you `.await` or poll them"]
 #[derive(Clone, Copy, Debug)]
 #[doc(hidden)] // so users only see `sleep_ticks` above.
 pub struct SleepForTick(pub usize);
