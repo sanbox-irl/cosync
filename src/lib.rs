@@ -199,6 +199,11 @@ impl<T: 'static + ?Sized> Cosync<T> {
     }
 }
 
+#[allow(clippy::non_send_fields_in_send_ty)]
+unsafe impl<T: Send + ?Sized> Send for Cosync<T> {}
+unsafe impl<T: Sync + ?Sized> Sync for Cosync<T> {}
+impl<T> Unpin for Cosync<T> {}
+
 /// A handle to spawn tasks.
 ///
 /// # Examples
