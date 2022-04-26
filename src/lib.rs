@@ -692,6 +692,7 @@ mod tests {
 
         executor.queue(move |input| async move {
             let sndr: std::sync::mpsc::Sender<_> = sndr;
+            sleep_ticks(1).await;
             sndr.send(input).unwrap();
         });
 
