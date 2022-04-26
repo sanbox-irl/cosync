@@ -37,7 +37,6 @@ pub struct Cosync<T: ?Sized> {
     pool: FuturesUnordered<FutureObject>,
     incoming: Arc<Mutex<VecDeque<FutureObject>>>,
     data: *mut Option<*mut T>,
-    kill_box: Arc<()>,
 }
 
 impl<T: 'static + ?Sized> Cosync<T> {
@@ -47,7 +46,6 @@ impl<T: 'static + ?Sized> Cosync<T> {
             pool: FuturesUnordered::new(),
             incoming: Default::default(),
             data: Box::into_raw(Box::new(None)),
-            kill_box: Arc::new(()),
         }
     }
 
@@ -77,8 +75,7 @@ impl<T: 'static + ?Sized> Cosync<T> {
     pub fn create_queue_handle(&self) -> CosyncQueueHandle<T> {
         CosyncQueueHandle {
             heap_ptr: self.data,
-            incoming: self.incoming.clone(),
-            kill_box: Arc::downgrade(&self.kill_box),
+            incoming: Arc::downgrade(&self.incoming),
         }
     }
 
@@ -239,8 +236,7 @@ impl<T> Unpin for Cosync<T> {}
 #[derive(Debug)]
 pub struct CosyncQueueHandle<T: ?Sized> {
     heap_ptr: *mut Option<*mut T>,
-    incoming: Arc<Mutex<VecDeque<FutureObject>>>,
-    kill_box: Weak<()>,
+    incoming: Weak<Mutex<VecDeque<FutureObject>>>,
 }
 
 impl<T: 'static + ?Sized> CosyncQueueHandle<T> {
@@ -250,19 +246,20 @@ impl<T: 'static + ?Sized> CosyncQueueHandle<T> {
         Task: FnOnce(CosyncInput<T>) -> Out + Send + 'static,
         Out: Future<Output = ()> + Send,
     {
-        // force the future to move...
-        let task = task;
-        let sec = CosyncInput(CosyncQueueHandle {
-            heap_ptr: self.heap_ptr,
-            incoming: self.incoming.clone(),
-            kill_box: self.kill_box.clone(),
-        });
+        if let Some(incoming) = self.incoming.upgrade() {
+            // force the future to move...
+            let task = task;
+            let sec = CosyncInput(CosyncQueueHandle {
+                heap_ptr: self.heap_ptr,
+                incoming: self.incoming.clone(),
+            });
 
-        let our_cb = Box::pin(async move {
-            task(sec).await;
-        });
+            let our_cb = Box::pin(async move {
+                task(sec).await;
+            });
 
-        self.incoming.lock().unwrap().push_back(FutureObject(our_cb));
+            incoming.lock().unwrap().push_back(FutureObject(our_cb));
+        }
     }
 }
 
@@ -280,7 +277,6 @@ impl<T: ?Sized> Clone for CosyncQueueHandle<T> {
         Self {
             heap_ptr: self.heap_ptr,
             incoming: self.incoming.clone(),
-            kill_box: self.kill_box.clone(),
         }
     }
 }
@@ -298,7 +294,7 @@ impl<T: 'static + ?Sized> CosyncInput<T> {
         // if you find this guard, it means that you somehow moved the `CosyncInput` out of
         // the closure, and then dropped the `Cosync`. Why would you do that? Don't do that.
         assert!(
-            Weak::strong_count(&self.0.kill_box) == 1,
+            Weak::strong_count(&self.0.incoming) == 1,
             "cosync was dropped improperly"
         );
 
@@ -315,7 +311,7 @@ impl<T: 'static + ?Sized> CosyncInput<T> {
     /// Queues a new task. This goes to the back of queue.
     pub fn queue<Task, Out>(&self, task: Task)
     where
-        Task: Fn(CosyncInput<T>) -> Out + Send + 'static,
+        Task: FnOnce(CosyncInput<T>) -> Out + Send + 'static,
         Out: Future<Output = ()> + Send,
     {
         self.0.queue(task)
@@ -674,6 +670,8 @@ mod tests {
         // the executor was dropped. whoopsie!
         let mut v = rx.recv().unwrap();
         *v.get() = 20;
+
+        panic!("panic!");
     }
 
     #[test]
