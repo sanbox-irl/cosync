@@ -657,11 +657,11 @@ mod tests {
         executor.run_until_stall(&mut value);
         assert_eq!(value, 10);
 
-        // // move it somewhere else..
-        // let mut executor = Box::new(executor);
-        // executor.run_until_stall(&mut value);
+        // move it somewhere else..
+        let mut executor = Box::new(executor);
+        executor.run_until_stall(&mut value);
 
-        // assert_eq!(value, 20);
+        assert_eq!(value, 20);
     }
 
     #[test]
