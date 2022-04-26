@@ -15,7 +15,6 @@ use std::{
     marker::PhantomData,
     ops,
     pin::Pin,
-    ptr::NonNull,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex, Weak,
@@ -37,7 +36,7 @@ use std::{
 pub struct Cosync<T: ?Sized> {
     pool: FuturesUnordered<FutureObject>,
     incoming: Arc<Mutex<VecDeque<FutureObject>>>,
-    data: Box<Option<NonNull<T>>>,
+    data: Box<Option<*const T>>,
     kill_box: Arc<()>,
 }
 
@@ -116,9 +115,7 @@ impl<T: 'static + ?Sized> Cosync<T> {
     /// are complete, including any spawned while running existing tasks.
     pub fn run_blocking(&mut self, parameter: &mut T) {
         // hoist the T:
-        unsafe {
-            *self.data = Some(NonNull::new_unchecked(parameter as *mut _));
-        }
+        *self.data = Some(parameter as *mut _);
 
         run_executor(|cx| self.poll_pool(cx));
 
@@ -157,9 +154,7 @@ impl<T: 'static + ?Sized> Cosync<T> {
     /// in the pool will try to make progress.
     pub fn run_until_stall(&mut self, parameter: &mut T) {
         // hoist the T:
-        unsafe {
-            *self.data = Some(NonNull::new_unchecked(parameter as *mut _));
-        }
+        *self.data = Some(parameter as *mut _);
 
         poll_executor(|ctx| {
             let _output = self.poll_pool(ctx);
@@ -227,7 +222,7 @@ impl<T> Unpin for Cosync<T> {}
 /// ```
 #[derive(Debug)]
 pub struct CosyncQueueHandle<T: ?Sized> {
-    heap_ptr: *const Option<NonNull<T>>,
+    heap_ptr: *const Option<*const T>,
     incoming: Arc<Mutex<VecDeque<FutureObject>>>,
     kill_box: Weak<()>,
 }
@@ -281,13 +276,12 @@ impl<T: 'static + ?Sized> CosyncInput<T> {
 
         // we can always dereference this data, as we maintain
         // that it's always present.
-        let o = unsafe {
-            (&*self.0.heap_ptr)
-                .expect("cosync was not initialized this run correctly")
-                .as_mut()
+        let operation = unsafe {
+            let heap_ptr: *const T = (&*self.0.heap_ptr).expect("cosync was not initialized this run correctly");
+            &mut *(heap_ptr as *mut T)
         };
 
-        CosyncInputGuard(o, PhantomData)
+        CosyncInputGuard(operation, PhantomData)
     }
 
     /// Queues a new task. This goes to the back of queue.
@@ -438,7 +432,7 @@ fn poll_executor<T, F: FnMut(&mut Context<'_>) -> T>(mut f: F) -> T {
 fn queue_task<T: 'static + ?Sized, Task, Out>(
     task: Task,
     kill_box: Weak<()>,
-    heap_ptr: *const Option<NonNull<T>>,
+    heap_ptr: *const Option<*const T>,
     incoming: &Arc<Mutex<VecDeque<FutureObject>>>,
 ) where
     Task: FnOnce(CosyncInput<T>) -> Out + Send + 'static,
