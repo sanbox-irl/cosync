@@ -8,6 +8,7 @@
 mod futures;
 use crate::futures::{enter::enter, waker_ref, ArcWake, FuturesUnordered};
 
+use parking_lot::Mutex;
 use std::{
     collections::VecDeque,
     fmt,
@@ -17,7 +18,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex, Weak,
+        Arc, Weak,
     },
     task::{Context, Poll},
     thread::{self, Thread},
@@ -57,12 +58,12 @@ impl<T: 'static + ?Sized> Cosync<T> {
     pub fn len(&self) -> usize {
         let one = if self.is_executing() { 1 } else { 0 };
 
-        one + self.incoming.lock().unwrap().len()
+        one + self.incoming.lock().len()
     }
 
     /// Returns true if no futures are being executed *and* there are no futures in the queue.
     pub fn is_empty(&self) -> bool {
-        !self.is_executing() && self.incoming.lock().unwrap().is_empty()
+        !self.is_executing() && self.incoming.lock().is_empty()
     }
 
     /// Returns true if `cosync` has a `Pending` future. It is possible for
@@ -187,7 +188,7 @@ impl<T: 'static + ?Sized> Cosync<T> {
     fn poll_pool_once(&mut self, cx: &mut Context<'_>) -> Poll<Option<()>> {
         // grab our next task...
         if self.pool.is_empty() {
-            if let Some(task) = self.incoming.lock().unwrap().pop_front() {
+            if let Some(task) = self.incoming.lock().pop_front() {
                 self.pool.push(task)
             }
         }
@@ -258,7 +259,7 @@ impl<T: 'static + ?Sized> CosyncQueueHandle<T> {
                 task(sec).await;
             });
 
-            incoming.lock().unwrap().push_back(FutureObject(our_cb));
+            incoming.lock().push_back(FutureObject(our_cb));
         }
     }
 }
@@ -492,6 +493,17 @@ impl Future for SleepForTick {
     }
 }
 
+/// The `Cosync` struct from which this `CosyncQueueHandle` was created was dropped already,
+/// so this task was not queued.
+#[derive(Debug)]
+pub struct CosyncWasDropped;
+
+impl fmt::Display for CosyncWasDropped {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad("the `Cosync` for this `CosyncQueueHandle` was dropped already. task was not queued")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -670,8 +682,25 @@ mod tests {
         // the executor was dropped. whoopsie!
         let mut v = rx.recv().unwrap();
         *v.get() = 20;
+    }
 
-        panic!("panic!");
+    #[test]
+    #[should_panic(expected = "cosync was not initialized this run correctly")]
+    fn ub2_on_move_is_prevented() {
+        let (sndr, rx) = std::sync::mpsc::channel();
+        let mut executor: Cosync<i32> = Cosync::new();
+
+        executor.queue(move |input| async move {
+            let sndr: std::sync::mpsc::Sender<_> = sndr;
+            sndr.send(input).unwrap();
+        });
+
+        let mut value = 0;
+        executor.run_blocking(&mut value);
+
+        // the executor was dropped. whoopsie!
+        let mut v = rx.recv().unwrap();
+        *v.get() = 20;
     }
 
     #[test]

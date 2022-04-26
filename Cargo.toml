@@ -8,6 +8,9 @@ repository = "https://github.com/sanbox-irl/cosync"
 description = "a single threaded, sequential, parameterized task pool for games"
 categories = ["game-development"]
 
+[dependencies]
+parking_lot = "0.12"
+
 [dev-dependencies]
 static_assertions = "1.1"
 trybuild = "1.0"

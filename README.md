@@ -60,4 +60,4 @@ This crate exposes two methods for driving the runtime: `run_until_stall` and `r
 
 There are three ways to make new tasks. First, the `Cosync` struct itself has a `queue` method on it. Secondly, each task gets a `CosyncInput<T>` as a parameter, which has `get` (to get access to your `&mut T`) and `queue` to queue another task (which is at the end of the queue, not necessarily after the task which added it). Lastly, you can create a `CosyncQueueHandle` with `Cosync::create_queue_handle` which is `Send` and can be given to other threads to create new tasks for the `Cosync`.
 
-This crate depends on only `std`. It is in an early state of development, but is in production ready state right now.
+This crate depends on only `std` and `parking_lot`. It is in an early state of development, but is in production ready state right now.
