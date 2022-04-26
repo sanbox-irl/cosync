@@ -41,7 +41,7 @@ pub struct Cosync<T: ?Sized> {
 }
 
 impl<T: 'static + ?Sized> Cosync<T> {
-    /// Create a new, empty queue of tasks.
+    /// Create a new, empty Cosync.
     pub fn new() -> Self {
         Self {
             pool: FuturesUnordered::new(),
@@ -110,14 +110,15 @@ impl<T: 'static + ?Sized> Cosync<T> {
     /// The function will block the calling thread until *all* tasks in the pool
     /// are complete, including any spawned while running existing tasks.
     pub fn run_blocking(&mut self, parameter: &mut T) {
-        // hoist the T:
+        // SAFETY: we own this box and make sure it's safe until we drop,
+        // so the pointer is still valid if we have an `&mut self`
         unsafe {
             *self.data = Some(parameter as *mut _);
         }
 
         run_executor(|cx| self.poll_pool(cx));
 
-        // we null out here so we don't do bad things
+        // safety: see above
         unsafe {
             *self.data = None;
         }
@@ -153,7 +154,8 @@ impl<T: 'static + ?Sized> Cosync<T> {
     /// of the pool's run or poll methods. While the function is running, all tasks
     /// in the pool will try to make progress.
     pub fn run_until_stall(&mut self, parameter: &mut T) {
-        // hoist the T:
+        // SAFETY: we own this box and make sure it's safe until we drop,
+        // so the pointer is still valid if we have an `&mut self`
         unsafe {
             *self.data = Some(parameter as *mut _);
         }
@@ -162,7 +164,7 @@ impl<T: 'static + ?Sized> Cosync<T> {
             let _output = self.poll_pool(ctx);
         });
 
-        // null it
+        // SAFETY: same as above, no one has deallocated this box
         unsafe {
             *self.data = None;
         }
@@ -299,7 +301,7 @@ impl<T: 'static + ?Sized> CosyncInput<T> {
             "cosync was dropped improperly"
         );
 
-        // we can always dereference this data, as we maintain
+        // SAFETY: we can always dereference this data, as we maintain
         // that it's always present.
         let operation = unsafe {
             let heap_ptr: *mut T = (&mut *self.0.heap_ptr).expect("cosync was not initialized this run correctly");
@@ -326,10 +328,12 @@ impl<T: 'static + ?Sized> CosyncInput<T> {
 
 // safety:
 // we create `CosyncInput` per task, and it doesn't escape our closure.
-// therefore, it's `*const` field should only be accessible when we know
-// it's valid.
+// therefore, it's `*const` field should only be accessible when we know it's valid.
 #[allow(clippy::non_send_fields_in_send_ty)]
 unsafe impl<T: ?Sized> Send for CosyncInput<T> {}
+// safety:
+// we create `CosyncInput` per task, and it doesn't escape our closure.
+// therefore, it's `*const` field should only be accessible when we know it's valid.
 unsafe impl<T: ?Sized> Sync for CosyncInput<T> {}
 
 /// A guarded pointer.
