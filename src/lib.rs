@@ -709,6 +709,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "miri cannot handle threading yet")]
     fn threading() {
         let mut cosync = Cosync::new();
         let handler = cosync.create_queue_handle();
@@ -728,7 +729,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)]
+    #[cfg_attr(miri, ignore = "miri will explode if we run this")]
     fn trybuild() {
         let t = trybuild::TestCases::new();
         t.compile_fail("tests/try_build/*.rs");
