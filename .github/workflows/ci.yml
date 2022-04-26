@@ -23,7 +23,7 @@ jobs:
       - name: test
         run: cargo test
       - name: clippy
-        run: clippy check
+        run: cargo clippy
   miri:
     name: Run fmt & miri
     runs-on: ubuntu-latest
@@ -44,4 +44,4 @@ jobs:
       - name: miri setup
         run: cargo miri setup
       - name: miri test
-        run: cargo miri run
+        run: cargo miri test

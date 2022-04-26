@@ -508,7 +508,7 @@ impl fmt::Display for CosyncWasDropped {
 mod tests {
     use super::*;
 
-    static_assertions::assert_not_impl_all!(CosyncInputGuard<'_, i32>: Send);
+    static_assertions::assert_not_impl_all!(CosyncInputGuard<'_, i32>: Send, Sync);
 
     #[test]
     fn ordering() {
