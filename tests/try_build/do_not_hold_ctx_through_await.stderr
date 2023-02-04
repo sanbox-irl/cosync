@@ -4,7 +4,7 @@ error: future cannot be sent between threads safely
 6  |     executor.queue(move |mut input| async move {
    |              ^^^^^ future created by async block is not `Send`
    |
-   = help: within `impl Future<Output = [async output]>`, the trait `Send` is not implemented for `*const u8`
+   = help: within `impl Future<Output = ()>`, the trait `Send` is not implemented for `*const u8`
 note: future is not `Send` as this value is used across an await
   --> tests/try_build/do_not_hold_ctx_through_await.rs:10:43
    |

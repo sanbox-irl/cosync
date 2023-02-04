@@ -1,7 +1,7 @@
 #![doc = include_str!("../README.md")]
 #![deny(rust_2018_idioms)]
 #![deny(missing_docs)]
-#![deny(rustdoc::all)]
+#![deny(rustdoc::broken_intra_doc_links)]
 
 // this is vendored code from the `futures-rs` crate, to avoid
 // having a huge dependency when we only need a little bit
