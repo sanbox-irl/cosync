@@ -92,7 +92,9 @@ impl<T: 'static + ?Sized> Cosync<T> {
         queue_handle.queue(task).unwrap()
     }
 
-    /// Run all tasks in the queue to completion. You probably want `run_until_stall`.
+    /// Run all tasks in the queue to completion. If a task won't complete, this will infinitely
+    /// retry it. You probably want `run_until_stall`, which returns once a task returns
+    /// `Polling::Pending`.
     ///
     /// ```
     /// # use cosync::Cosync;
@@ -117,7 +119,32 @@ impl<T: 'static + ?Sized> Cosync<T> {
             *self.data = Some(parameter as *mut _);
         }
 
-        run_executor(|cx| self.poll_pool(cx));
+        let _enter = enter().expect(
+            "cannot execute `LocalPool` executor from within \
+             another executor",
+        );
+
+        CURRENT_THREAD_NOTIFY.with(|thread_notify| {
+            let waker = waker_ref::waker_ref(thread_notify);
+            let mut cx = Context::from_waker(&waker);
+            loop {
+                if let Poll::Ready(t) = self.poll_pool(&mut cx) {
+                    return t;
+                }
+                // Consume the wakeup that occurred while executing `f`, if any.
+                let unparked = thread_notify.unparked.swap(false, Ordering::Acquire);
+                if !unparked {
+                    // No wakeup occurred. It may occur now, right before parking,
+                    // but in that case the token made available by `unpark()`
+                    // is guaranteed to still be available and `park()` is a no-op.
+                    thread::park();
+                    // When the thread is unparked, `unparked` will have been set
+                    // and needs to be unset before the next call to `f` to avoid
+                    // a redundant loop iteration.
+                    thread_notify.unparked.store(false, Ordering::Release);
+                }
+            }
+        });
 
         // safety: see above
         unsafe {
@@ -161,8 +188,15 @@ impl<T: 'static + ?Sized> Cosync<T> {
             *self.data = Some(parameter as *mut _);
         }
 
-        poll_executor(|ctx| {
-            let _output = self.poll_pool(ctx);
+        let _enter = enter().expect(
+            "cannot execute `LocalPool` executor from within \
+             another executor",
+        );
+
+        let _ = CURRENT_THREAD_NOTIFY.with(|thread_notify| {
+            let waker = waker_ref::waker_ref(thread_notify);
+            let mut cx = Context::from_waker(&waker);
+            self.poll_pool(&mut cx)
         });
 
         // SAFETY: same as above, no one has deallocated this box
@@ -176,28 +210,24 @@ impl<T: 'static + ?Sized> Cosync<T> {
     fn poll_pool(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         // state for the FuturesUnordered, which will never be used
         loop {
-            let ret = self.poll_pool_once(cx);
+            // try to execute the next ready future
+            let ret = Pin::new(&mut self.pool).poll_next(cx);
 
             // no queued tasks; we may be done
             match ret {
+                // this means an inner task is pending
                 Poll::Pending => return Poll::Pending,
-                Poll::Ready(None) => return Poll::Ready(()),
-                _ => {}
+                // the pool was empty already, or we just completed that task.
+                Poll::Ready(None) | Poll::Ready(Some(_)) => {
+                    // grab our next task...
+                    if let Some(task) = self.queue.lock().incoming.pop_front() {
+                        self.pool.push(task)
+                    } else {
+                        return Poll::Ready(());
+                    }
+                }
             }
         }
-    }
-
-    // Try make minimal progress on the pool of spawned tasks
-    fn poll_pool_once(&mut self, cx: &mut Context<'_>) -> Poll<Option<()>> {
-        // grab our next task...
-        if self.pool.is_empty() {
-            if let Some(task) = self.queue.lock().incoming.pop_front() {
-                self.pool.push(task)
-            }
-        }
-
-        // try to execute the next ready future
-        Pin::new(&mut self.pool).poll_next(cx)
     }
 }
 
@@ -502,53 +532,6 @@ thread_local! {
         thread: thread::current(),
         unparked: AtomicBool::new(false),
     });
-}
-
-// Set up and run a basic single-threaded spawner loop, invoking `f` on each
-// turn.
-fn run_executor<T, F>(mut work_on_future: F) -> T
-where
-    F: FnMut(&mut Context<'_>) -> Poll<T>,
-{
-    let _enter = enter().expect(
-        "cannot execute `LocalPool` executor from within \
-         another executor",
-    );
-
-    CURRENT_THREAD_NOTIFY.with(|thread_notify| {
-        let waker = waker_ref::waker_ref(thread_notify);
-        let mut cx = Context::from_waker(&waker);
-        loop {
-            if let Poll::Ready(t) = work_on_future(&mut cx) {
-                return t;
-            }
-            // Consume the wakeup that occurred while executing `f`, if any.
-            let unparked = thread_notify.unparked.swap(false, Ordering::Acquire);
-            if !unparked {
-                // No wakeup occurred. It may occur now, right before parking,
-                // but in that case the token made available by `unpark()`
-                // is guaranteed to still be available and `park()` is a no-op.
-                thread::park();
-                // When the thread is unparked, `unparked` will have been set
-                // and needs to be unset before the next call to `f` to avoid
-                // a redundant loop iteration.
-                thread_notify.unparked.store(false, Ordering::Release);
-            }
-        }
-    })
-}
-
-fn poll_executor<T, F: FnMut(&mut Context<'_>) -> T>(mut f: F) -> T {
-    let _enter = enter().expect(
-        "cannot execute `LocalPool` executor from within \
-         another executor",
-    );
-
-    CURRENT_THREAD_NOTIFY.with(|thread_notify| {
-        let waker = waker_ref::waker_ref(thread_notify);
-        let mut cx = Context::from_waker(&waker);
-        f(&mut cx)
-    })
 }
 
 #[cfg(test)]
