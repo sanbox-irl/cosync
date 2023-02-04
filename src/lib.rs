@@ -271,7 +271,6 @@ impl<T: 'static + ?Sized> CosyncQueueHandle<T> {
 // never dereferences invalid data, and it's only made in the same thread
 // as Cosync, so we should never have a problem with multithreaded access
 // at the same time.
-#[allow(clippy::non_send_fields_in_send_ty)]
 unsafe impl<T: ?Sized> Send for CosyncQueueHandle<T> {}
 unsafe impl<T: ?Sized> Sync for CosyncQueueHandle<T> {}
 
@@ -329,7 +328,6 @@ impl<T: 'static + ?Sized> CosyncInput<T> {
 // safety:
 // we create `CosyncInput` per task, and it doesn't escape our closure.
 // therefore, it's `*const` field should only be accessible when we know it's valid.
-#[allow(clippy::non_send_fields_in_send_ty)]
 unsafe impl<T: ?Sized> Send for CosyncInput<T> {}
 // safety:
 // we create `CosyncInput` per task, and it doesn't escape our closure.
