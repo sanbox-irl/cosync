@@ -80,6 +80,46 @@ impl<T: 'static + ?Sized> Cosync<T> {
         }
     }
 
+    /// Tries to force unqueueing a task. If that task is already being ran, and you want to
+    /// external cancel it, run `force_clear_running` instead to clear all running tasks, or
+    /// `clear` to clear the entire Cosync.
+    ///
+    /// This returns `true` on success and `false` on failure.
+    pub fn unqueue_task(&mut self, task_id: CosyncTaskId) -> bool {
+        let queue_handle = self.create_queue_handle().queue.upgrade().unwrap();
+
+        let incoming = &mut queue_handle.lock().incoming;
+        let Some(index) = incoming.iter().position(|future_obj| future_obj.1 == task_id) else { return false };
+        incoming.remove(index);
+
+        true
+    }
+
+    /// Cosync keeps track of running task(s) and queued task(s). You can use this function to clear
+    /// only the running tasks. This generally is a bad idea, producing complicated logic. In
+    /// general, it's much easier to cancel internally in a future.
+    ///
+    /// For Cosync's which are `PollMultiple`, this will cancel all running tasks. It is not
+    /// possible to only cancel a single running task right now. If you need that, please submit
+    /// an issue.
+    pub fn clear_running(&mut self) {
+        self.pool.clear();
+    }
+
+    /// Clears all queued tasks. Currently running tasks are unaffected. All `CosyncQueueHandler`s
+    /// are still valid.
+    pub fn clear_queue(&mut self) {
+        self.queue.lock().incoming.clear();
+    }
+
+    /// This clears all running tasks and all queued tasks.
+    ///
+    /// All `CosyncQueueHandler`s are still valid.
+    pub fn clear(&mut self) {
+        self.pool.clear();
+        self.queue.lock().incoming.clear();
+    }
+
     /// Adds a new Task to the TaskQueue.
     pub fn queue<Task, Out>(&mut self, task: Task) -> CosyncTaskId
     where
@@ -280,9 +320,10 @@ pub struct CosyncQueueHandle<T: ?Sized> {
 }
 
 impl<T: 'static + ?Sized> CosyncQueueHandle<T> {
-    /// Adds a new Task to the TaskQueue. A return of `None` indicates that the task
-    /// failed to be queued. This only happens if the corresponding `Cosync` has been dropped
-    /// while a `CosyncQueueHandle` still exists.
+    /// Adds a new Task to the TaskQueue.
+    ///
+    /// A return of `None` indicates that the task failed to be queued because the
+    /// corresponding `Cosync` has been dropped while a `CosyncQueueHandle` still exists.
     ///
     /// ```
     /// # use cosync::Cosync;
@@ -316,14 +357,32 @@ impl<T: 'static + ?Sized> CosyncQueueHandle<T> {
             });
 
             let mut mutex_lock = queue.lock();
-            mutex_lock.incoming.push_back(FutureObject(our_cb));
-
             let id = CosyncTaskId(mutex_lock.counter);
             // note: we use a wrapping add here just so we don't panic on release mode for...
             // absurd numbers of tasks.
             mutex_lock.counter = mutex_lock.counter.wrapping_add(1);
+            mutex_lock.incoming.push_back(FutureObject(our_cb, id));
 
             id
+        })
+    }
+
+    /// Tries to force unqueueing a task.
+    ///
+    /// A return of `None` indicates that the task failed to be queued because the
+    /// corresponding `Cosync` has been dropped while a `CosyncQueueHandle` still exists.
+    ///
+    /// If that task is already being ran, and you want to externally cancel it, run
+    /// `Cosync::clear_running` instead.
+    ///
+    /// This returns `Some(true)` on success.
+    pub fn unqueue_task(&mut self, task_id: CosyncTaskId) -> Option<bool> {
+        self.queue.upgrade().map(|queue_handle| {
+            let incoming = &mut queue_handle.lock().incoming;
+            let Some(index) = incoming.iter().position(|future_obj| future_obj.1 == task_id) else { return false };
+            incoming.remove(index);
+
+            true
         })
     }
 }
@@ -415,7 +474,7 @@ impl<'a, T: ?Sized> ops::DerefMut for CosyncInputGuard<'a, T> {
     }
 }
 
-struct FutureObject(Pin<Box<dyn Future<Output = ()> + 'static>>);
+struct FutureObject(Pin<Box<dyn Future<Output = ()> + 'static>>, CosyncTaskId);
 impl Future for FutureObject {
     type Output = ();
 
@@ -831,5 +890,38 @@ mod tests {
         assert_eq!(id, CosyncTaskId(0));
         let second_task = cosync.queue(|_input| async {});
         assert!(second_task > id);
+    }
+
+    #[test]
+    fn cancelling_a_task() {
+        let mut cosync: Cosync<i32> = Cosync::new();
+
+        cosync.queue(|mut input| async move {
+            *input.get() += 1;
+
+            sleep_ticks(1).await;
+
+            *input.get() += 1;
+        });
+
+        let mut value = 0;
+
+        cosync.run_until_stall(&mut value);
+
+        assert_eq!(value, 1);
+
+        cosync.clear_running();
+
+        cosync.run_until_stall(&mut value);
+
+        // it's still 1 because we cancelled the task which would have otherwise gotten it to 2
+        assert_eq!(value, 1);
+
+        assert!(cosync.is_empty());
+        let id = cosync.queue(|_| async {});
+        assert_eq!(cosync.len(), 1);
+        let success = cosync.unqueue_task(id);
+        assert!(success);
+        assert!(cosync.is_empty());
     }
 }
