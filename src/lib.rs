@@ -36,7 +36,7 @@ use std::{
 #[derive(Debug)]
 pub struct Cosync<T: ?Sized> {
     pool: FuturesUnordered<FutureObject>,
-    incoming: Arc<Mutex<VecDeque<FutureObject>>>,
+    queue: Arc<Mutex<IncomingQueue>>,
     data: *mut Option<*mut T>,
 }
 
@@ -45,7 +45,7 @@ impl<T: 'static + ?Sized> Cosync<T> {
     pub fn new() -> Self {
         Self {
             pool: FuturesUnordered::new(),
-            incoming: Default::default(),
+            queue: Arc::default(),
             data: Box::into_raw(Box::new(None)),
         }
     }
@@ -58,12 +58,12 @@ impl<T: 'static + ?Sized> Cosync<T> {
     pub fn len(&self) -> usize {
         let one = self.is_executing() as usize;
 
-        one + self.incoming.lock().len()
+        one + self.queue.lock().incoming.len()
     }
 
     /// Returns true if no futures are being executed *and* there are no futures in the queue.
     pub fn is_empty(&self) -> bool {
-        !self.is_executing() && self.incoming.lock().is_empty()
+        !self.is_executing() && self.queue.lock().incoming.is_empty()
     }
 
     /// Returns true if `cosync` has a `Pending` future. It is possible for
@@ -76,19 +76,20 @@ impl<T: 'static + ?Sized> Cosync<T> {
     pub fn create_queue_handle(&self) -> CosyncQueueHandle<T> {
         CosyncQueueHandle {
             heap_ptr: self.data,
-            incoming: Arc::downgrade(&self.incoming),
+            queue: Arc::downgrade(&self.queue),
         }
     }
 
     /// Adds a new Task to the TaskQueue.
-    pub fn queue<Task, Out>(&mut self, task: Task)
+    pub fn queue<Task, Out>(&mut self, task: Task) -> CosyncTaskId
     where
         Task: FnOnce(CosyncInput<T>) -> Out + Send + 'static,
         Out: Future<Output = ()> + Send,
     {
         let queue_handle = self.create_queue_handle();
 
-        queue_handle.queue(task)
+        // panics: we can unwrap here because know that the cosync exists because we are the cosync.
+        queue_handle.queue(task).unwrap()
     }
 
     /// Run all tasks in the queue to completion. You probably want `run_until_stall`.
@@ -190,13 +191,19 @@ impl<T: 'static + ?Sized> Cosync<T> {
     fn poll_pool_once(&mut self, cx: &mut Context<'_>) -> Poll<Option<()>> {
         // grab our next task...
         if self.pool.is_empty() {
-            if let Some(task) = self.incoming.lock().pop_front() {
+            if let Some(task) = self.queue.lock().incoming.pop_front() {
                 self.pool.push(task)
             }
         }
 
         // try to execute the next ready future
         Pin::new(&mut self.pool).poll_next(cx)
+    }
+}
+
+impl<T: 'static> Default for Cosync<T> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -239,30 +246,55 @@ impl<T> Unpin for Cosync<T> {}
 #[derive(Debug)]
 pub struct CosyncQueueHandle<T: ?Sized> {
     heap_ptr: *mut Option<*mut T>,
-    incoming: Weak<Mutex<VecDeque<FutureObject>>>,
+    queue: Weak<Mutex<IncomingQueue>>,
 }
 
 impl<T: 'static + ?Sized> CosyncQueueHandle<T> {
-    /// Adds a new Task to the TaskQueue.
-    pub fn queue<Task, Out>(&self, task: Task)
+    /// Adds a new Task to the TaskQueue. A return of `None` indicates that the task
+    /// failed to be queued. This only happens if the corresponding `Cosync` has been dropped
+    /// while a `CosyncQueueHandle` still exists.
+    ///
+    /// ```
+    /// # use cosync::Cosync;
+    ///
+    /// let mut cosync = Cosync::<i32>::new();
+    /// let mut queue_handle = cosync.create_queue_handle();
+    ///
+    /// let task_id = queue_handle.queue(|_| async {});
+    /// assert!(task_id.is_some());
+    ///
+    /// drop(cosync);
+    ///
+    /// let task_id = queue_handle.queue(|_| async {});
+    /// assert!(task_id.is_none());
+    /// ```
+    pub fn queue<Task, Out>(&self, task: Task) -> Option<CosyncTaskId>
     where
         Task: FnOnce(CosyncInput<T>) -> Out + Send + 'static,
         Out: Future<Output = ()> + Send,
     {
-        if let Some(incoming) = self.incoming.upgrade() {
+        self.queue.upgrade().map(|queue| {
             // force the future to move...
             let task = task;
             let sec = CosyncInput(CosyncQueueHandle {
                 heap_ptr: self.heap_ptr,
-                incoming: self.incoming.clone(),
+                queue: self.queue.clone(),
             });
 
             let our_cb = Box::pin(async move {
                 task(sec).await;
             });
 
-            incoming.lock().push_back(FutureObject(our_cb));
-        }
+            let mut mutex_lock = queue.lock();
+            mutex_lock.incoming.push_back(FutureObject(our_cb));
+
+            let id = CosyncTaskId(mutex_lock.counter);
+            // note: we use a wrapping add here just so we don't panic on release mode for...
+            // absurd numbers of tasks.
+            mutex_lock.counter = mutex_lock.counter.wrapping_add(1);
+
+            id
+        })
     }
 }
 
@@ -278,7 +310,7 @@ impl<T: ?Sized> Clone for CosyncQueueHandle<T> {
     fn clone(&self) -> Self {
         Self {
             heap_ptr: self.heap_ptr,
-            incoming: self.incoming.clone(),
+            queue: self.queue.clone(),
         }
     }
 }
@@ -295,10 +327,7 @@ impl<T: 'static + ?Sized> CosyncInput<T> {
     pub fn get(&mut self) -> CosyncInputGuard<'_, T> {
         // if you find this guard, it means that you somehow moved the `CosyncInput` out of
         // the closure, and then dropped the `Cosync`. Why would you do that? Don't do that.
-        assert!(
-            Weak::strong_count(&self.0.incoming) == 1,
-            "cosync was dropped improperly"
-        );
+        assert!(Weak::strong_count(&self.0.queue) == 1, "cosync was dropped improperly");
 
         // SAFETY: we can always dereference this data, as we maintain
         // that it's always present.
@@ -311,12 +340,14 @@ impl<T: 'static + ?Sized> CosyncInput<T> {
     }
 
     /// Queues a new task. This goes to the back of queue.
-    pub fn queue<Task, Out>(&self, task: Task)
+    pub fn queue<Task, Out>(&self, task: Task) -> CosyncTaskId
     where
         Task: FnOnce(CosyncInput<T>) -> Out + Send + 'static,
         Out: Future<Output = ()> + Send,
     {
-        self.0.queue(task)
+        // if you find this unwrap, it means that you somehow moved the `CosyncInput` out of
+        // the closure, and then dropped the `Cosync`. Don't do that.
+        self.0.queue(task).expect("cosync was dropped improperly")
     }
 
     /// Creates a queue handle which can be used to spawn tasks.
@@ -354,12 +385,6 @@ impl<'a, T: ?Sized> ops::DerefMut for CosyncInputGuard<'a, T> {
     }
 }
 
-impl<T: 'static> Default for Cosync<T> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 struct FutureObject(Pin<Box<dyn Future<Output = ()> + 'static>>);
 impl Future for FutureObject {
     type Output = ();
@@ -373,6 +398,77 @@ impl fmt::Debug for FutureObject {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FutureObject").finish_non_exhaustive()
     }
+}
+
+/// Sleep the `Cosync` for a given number of calls to `run_until_stall`.
+///
+/// If you run `run_until_stall` once per tick in your main loop, then
+/// this will sleep for that number of ticks.
+pub fn sleep_ticks(ticks: usize) -> SleepForTick {
+    SleepForTick::new(ticks)
+}
+
+/// A helper struct which registers a sleep for a given number of ticks.
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+#[derive(Clone, Copy, Debug)]
+#[doc(hidden)] // so users only see `sleep_ticks` above.
+pub struct SleepForTick(pub usize);
+
+impl SleepForTick {
+    /// Sleep for the number of ticks provided.
+    pub fn new(ticks: usize) -> Self {
+        Self(ticks)
+    }
+}
+
+impl Future for SleepForTick {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.0 == 0 {
+            Poll::Ready(())
+        } else {
+            self.0 -= 1;
+
+            // temp: this is relatively expensive.
+            // we should be able to just register this at will
+            cx.waker().wake_by_ref();
+
+            Poll::Pending
+        }
+    }
+}
+
+/// An opaque task identifier, wrapping around a u64. You can use comparison operations to check
+/// task id equality and task id age. In general, a task made later will have a greater identity.
+///
+/// *However,* this is implementing with `wrapping_add`, so if you make `usize::MAX` tasks, then the
+/// "age" of a task will not be deducible from comparison operations; ie, you'll get a
+/// `CosyncTaskId(0)` eventually. You will probably have ran out of RAM at that point, so in
+/// practice, this won't come up.
+///
+/// ```
+/// # use cosync::Cosync;
+/// let mut cosync: Cosync<i32> = Cosync::new();
+///
+/// let first_task = cosync.queue(|_input| async {});
+/// let second_task = cosync.queue(|_input| async {});
+/// assert!(second_task > first_task);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(transparent)]
+pub struct CosyncTaskId(usize);
+
+impl CosyncTaskId {
+    /// Creates a CosyncTaskId set to `usize::MAX`. Theoretically, this could refer to a valid task
+    /// but would be exceedingly unlikely.
+    pub const DANGLING: CosyncTaskId = CosyncTaskId(usize::MAX);
+}
+
+#[derive(Debug, Default)]
+struct IncomingQueue {
+    incoming: VecDeque<FutureObject>,
+    counter: usize,
 }
 
 struct ThreadNotify {
@@ -453,45 +549,6 @@ fn poll_executor<T, F: FnMut(&mut Context<'_>) -> T>(mut f: F) -> T {
         let mut cx = Context::from_waker(&waker);
         f(&mut cx)
     })
-}
-
-/// Sleep the `Cosync` for a given number of calls to `run_until_stall`.
-///
-/// If you run `run_until_stall` once per tick in your main loop, then
-/// this will sleep for that number of ticks.
-pub fn sleep_ticks(ticks: usize) -> SleepForTick {
-    SleepForTick::new(ticks)
-}
-
-/// A helper struct which registers a sleep for a given number of ticks.
-#[must_use = "futures do nothing unless you `.await` or poll them"]
-#[derive(Clone, Copy, Debug)]
-#[doc(hidden)] // so users only see `sleep_ticks` above.
-pub struct SleepForTick(pub usize);
-
-impl SleepForTick {
-    /// Sleep for the number of ticks provided.
-    pub fn new(ticks: usize) -> Self {
-        Self(ticks)
-    }
-}
-
-impl Future for SleepForTick {
-    type Output = ();
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if self.0 == 0 {
-            Poll::Ready(())
-        } else {
-            self.0 -= 1;
-
-            // temp: this is relatively expensive.
-            // we should be able to just register this at will
-            cx.waker().wake_by_ref();
-
-            Poll::Pending
-        }
-    }
 }
 
 #[cfg(test)]
@@ -781,5 +838,15 @@ mod tests {
 
             assert_eq!(*vec, [10, 10]);
         });
+    }
+
+    #[test]
+    fn task_id_numbers() {
+        let mut cosync: Cosync<i32> = Cosync::new();
+
+        let id = cosync.queue(|_input| async {});
+        assert_eq!(id, CosyncTaskId(0));
+        let second_task = cosync.queue(|_input| async {});
+        assert!(second_task > id);
     }
 }
