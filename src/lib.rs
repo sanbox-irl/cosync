@@ -371,19 +371,19 @@ impl Future for FutureObject {
 
 impl fmt::Debug for FutureObject {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("FutureObject").finish()
+        f.debug_struct("FutureObject").finish_non_exhaustive()
     }
 }
 
-pub(crate) struct ThreadNotify {
+struct ThreadNotify {
     /// The (single) executor thread.
-    pub thread: Thread,
+    thread: Thread,
     /// A flag to ensure a wakeup (i.e. `unpark()`) is not "forgotten"
     /// before the next `park()`, which may otherwise happen if the code
     /// being executed as part of the future(s) being polled makes use of
     /// park / unpark calls of its own, i.e. we cannot assume that no other
     /// code uses park / unpark on the executing `thread`.
-    pub unparked: AtomicBool,
+    unparked: AtomicBool,
 }
 
 impl ArcWake for ThreadNotify {
@@ -459,7 +459,6 @@ fn poll_executor<T, F: FnMut(&mut Context<'_>) -> T>(mut f: F) -> T {
 ///
 /// If you run `run_until_stall` once per tick in your main loop, then
 /// this will sleep for that number of ticks.
-/// If you run `run`
 pub fn sleep_ticks(ticks: usize) -> SleepForTick {
     SleepForTick::new(ticks)
 }
@@ -492,17 +491,6 @@ impl Future for SleepForTick {
 
             Poll::Pending
         }
-    }
-}
-
-/// The `Cosync` struct from which this `CosyncQueueHandle` was created was dropped already,
-/// so this task was not queued.
-#[derive(Debug)]
-pub struct CosyncWasDropped;
-
-impl fmt::Display for CosyncWasDropped {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.pad("the `Cosync` for this `CosyncQueueHandle` was dropped already. task was not queued")
     }
 }
 

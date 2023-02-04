@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Removed: `CosyncWasDropped` was declared, but not used. This is a breaking change, but would be bizarre if a user relied on it.
+
 ## [0.2.1] - 2022-04-22
 
 - Added: Allowed creating a queue handle from `CosyncInput`.
