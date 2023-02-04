@@ -56,7 +56,7 @@ impl<T: 'static + ?Sized> Cosync<T> {
     ///
     /// [is_executing]: Self::is_executing
     pub fn len(&self) -> usize {
-        let one = if self.is_executing() { 1 } else { 0 };
+        let one = self.is_executing() as usize;
 
         one + self.incoming.lock().len()
     }
@@ -304,7 +304,7 @@ impl<T: 'static + ?Sized> CosyncInput<T> {
         // SAFETY: we can always dereference this data, as we maintain
         // that it's always present.
         let operation = unsafe {
-            let heap_ptr: *mut T = (&mut *self.0.heap_ptr).expect("cosync was not initialized this run correctly");
+            let heap_ptr: *mut T = (*self.0.heap_ptr).expect("cosync was not initialized this run correctly");
             &mut *heap_ptr
         };
 
