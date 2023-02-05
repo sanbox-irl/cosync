@@ -4,6 +4,7 @@
 
 - BREAKING: `is_executing` has been renamed `is_running`. It now takes a parameter. Use `is_running_any` for previous behavior.
 - Added: `queue`ing a task returns a `CosyncTaskId`. This can be used in `unqueue_task`, `stop_running_task`, and for comparison operations between task ids.
+- Added: an example for how to use Cosync.
 - Removed: `CosyncWasDropped` was declared, but not used. This is a breaking change, but would be bizarre if a user relied on it.
 
 ## [0.2.1] - 2022-04-22
