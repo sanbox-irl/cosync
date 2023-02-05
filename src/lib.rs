@@ -33,22 +33,38 @@ use std::{
 /// and calling [queue](CosyncQueueHandle::queue), or, within a task, calling
 /// [queue_task](CosyncInput::queue) on [CosyncInput].
 #[derive(Debug)]
-pub struct Cosync<T: ?Sized> {
+pub struct Cosync<T: ?Sized, M = SingleTask> {
     pool: FuturesUnordered<FutureObject>,
     queue: Arc<Mutex<IncomingQueue>>,
     data: *mut Option<*mut T>,
+    _task_manager: PhantomData<M>,
 }
 
-impl<T: 'static + ?Sized> Cosync<T> {
+impl<T: 'static + ?Sized> Cosync<T, SingleTask> {
     /// Create a new, empty Cosync.
     pub fn new() -> Self {
         Self {
             pool: FuturesUnordered::new(),
             queue: Arc::default(),
             data: Box::into_raw(Box::new(None)),
+            _task_manager: PhantomData,
         }
     }
+}
 
+impl<T: 'static + ?Sized> Cosync<T, MultipleTasks> {
+    /// Create a new, empty Cosync which processes multiple tasks at once.
+    pub fn new_multiple() -> Self {
+        Self {
+            pool: FuturesUnordered::new(),
+            queue: Arc::default(),
+            data: Box::into_raw(Box::new(None)),
+            _task_manager: PhantomData,
+        }
+    }
+}
+
+impl<T: 'static + ?Sized, M: TaskManager> Cosync<T, M> {
     /// Returns the number of tasks queued. This *includes* the task currently being executed. Use
     /// [is_running] to see if there is a task currently being executed (ie, it returned `Pending`
     /// at some point in its execution).
@@ -193,7 +209,7 @@ impl<T: 'static + ?Sized> Cosync<T> {
             let waker = waker_ref::waker_ref(thread_notify);
             let mut cx = Context::from_waker(&waker);
             loop {
-                if let Poll::Ready(t) = self.poll_pool(&mut cx) {
+                if let Poll::Ready(t) = M::poll_pool(self, &mut cx) {
                     return t;
                 }
                 // Consume the wakeup that occurred while executing `f`, if any.
@@ -261,7 +277,7 @@ impl<T: 'static + ?Sized> Cosync<T> {
         let _ = CURRENT_THREAD_NOTIFY.with(|thread_notify| {
             let waker = waker_ref::waker_ref(thread_notify);
             let mut cx = Context::from_waker(&waker);
-            self.poll_pool(&mut cx)
+            M::poll_pool(self, &mut cx)
         });
 
         // SAFETY: same as above, no one has deallocated this box
@@ -269,40 +285,21 @@ impl<T: 'static + ?Sized> Cosync<T> {
             *self.data = None;
         }
     }
-
-    // Make maximal progress on the entire pool of spawned task, returning `Ready`
-    // if the pool is empty and `Pending` if no further progress can be made.
-    fn poll_pool(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        // state for the FuturesUnordered, which will never be used
-        loop {
-            // try to execute the next ready future
-            let ret = Pin::new(&mut self.pool).poll_next(cx);
-
-            // no queued tasks; we may be done
-            match ret {
-                // this means an inner task is pending
-                Poll::Pending => return Poll::Pending,
-                // the pool was empty already, or we just completed that task.
-                Poll::Ready(None) | Poll::Ready(Some(_)) => {
-                    // grab our next task...
-                    if let Some(task) = unlock_mutex(&self.queue).incoming.pop_front() {
-                        self.pool.push(task)
-                    } else {
-                        return Poll::Ready(());
-                    }
-                }
-            }
-        }
-    }
 }
 
-impl<T: 'static> Default for Cosync<T> {
+impl<T: 'static> Default for Cosync<T, SingleTask> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T: ?Sized> Drop for Cosync<T> {
+impl<T: 'static> Default for Cosync<T, MultipleTasks> {
+    fn default() -> Self {
+        Self::new_multiple()
+    }
+}
+
+impl<T: ?Sized, M> Drop for Cosync<T, M> {
     fn drop(&mut self) {
         // SAFETY: this is safe because we made this from
         // a box previously.
@@ -313,9 +310,9 @@ impl<T: ?Sized> Drop for Cosync<T> {
 }
 
 #[allow(clippy::non_send_fields_in_send_ty)]
-unsafe impl<T: Send + ?Sized> Send for Cosync<T> {}
-unsafe impl<T: Sync + ?Sized> Sync for Cosync<T> {}
-impl<T> Unpin for Cosync<T> {}
+unsafe impl<T: Send + ?Sized, M> Send for Cosync<T, M> {}
+unsafe impl<T: Sync + ?Sized, M> Sync for Cosync<T, M> {}
+impl<T, M> Unpin for Cosync<T, M> {}
 
 /// A handle to spawn tasks.
 ///
@@ -579,6 +576,97 @@ impl CosyncTaskId {
     pub const DANGLING: CosyncTaskId = CosyncTaskId(usize::MAX);
 }
 
+/// An unstable trait for managing cosync task counts.
+pub trait TaskManager: Sized {
+    /// Polls the inner pool. This is unstable and should only be implemented within the library.
+    /// Return `Poll::Ready(None)` to continue polling the pool in contexts where we poll more than
+    /// once.
+    fn poll_pool<T: ?Sized>(cosync: &mut Cosync<T, Self>, cx: &mut Context<'_>) -> Poll<()>;
+}
+
+/// The default Cosync `TaskManager` -- this means that Cosync will complete one task after another,
+/// entirely sequentially. If a task is running, no other task will be ran until that task
+/// completes.
+///
+/// This is very useful for logical operations, such as directing an actor in a scene, but less
+/// useful for visual operations, such as tweening many things at once. For that, try
+/// `MultipleTasks`.
+pub struct SingleTask;
+
+impl TaskManager for SingleTask {
+    fn poll_pool<T: ?Sized>(cosync: &mut Cosync<T, Self>, cx: &mut Context<'_>) -> Poll<()> {
+        loop {
+            // try to execute the next ready future
+            let pinned_pool = Pin::new(&mut cosync.pool);
+            let ret = pinned_pool.poll_next(cx);
+
+            // no queued tasks; we may be done
+            match ret {
+                // this means an inner task is pending
+                Poll::Pending => return Poll::Pending,
+                // the pool was empty already, or we just completed that task.
+                Poll::Ready(None) | Poll::Ready(Some(())) => {
+                    // grab our next task...
+                    if let Some(task) = unlock_mutex(&cosync.queue).incoming.pop_front() {
+                        cosync.pool.push(task);
+
+                        // and now let's re-run this bad boy
+                    } else {
+                        return Poll::Ready(());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A `Multiple` Cosync will try to do work on all its queued tasks at the same time. If a task is
+/// queued, work will be done on that task the next time a Cosync is polled.
+///
+/// This is very useful for visual operations, susuch as tweening many things at once, but less
+/// useful for logical operations, such as directing an actor in a scene. For that, try
+/// `SingleTask`.
+pub struct MultipleTasks;
+
+impl TaskManager for MultipleTasks {
+    fn poll_pool<T: ?Sized>(cosync: &mut Cosync<T, Self>, cx: &mut Context<'_>) -> Poll<()> {
+        fn dump_tasks<T: ?Sized>(cosync: &mut Cosync<T, MultipleTasks>) {
+            let mut queue = unlock_mutex(&cosync.queue);
+            for task in queue.incoming.drain(..) {
+                cosync.pool.push(task);
+            }
+        }
+
+        // loop {
+        // grab all our next tasks
+        dump_tasks(cosync);
+
+        // and now we vibe.
+        let pinned_pool = Pin::new(&mut cosync.pool);
+        pinned_pool.poll_next(cx).map(|_| ())
+
+        // match ret {
+        //     // this means an inner task is pending
+        //     Poll::Pending => return Poll::Pending,
+        //     // this gives us some value, but we don't really care -- we just want to know if
+        // we've finished polling     // for stuff
+        //     Poll::Ready(None) | Poll::Ready(_) => {
+        //         // grab all our next tasks -- we might have just made some
+        //         dump_tasks(cosync);
+
+        //         if cosync.pool.is_empty() {
+        //             dump_tasks(cosync);
+
+        //             if cosync.pool.is_empty() {
+        //                 return Poll::Ready(());
+        //             }
+        //         }
+        //     }
+        // }
+        // }
+    }
+}
+
 #[derive(Debug, Default)]
 struct IncomingQueue {
     incoming: VecDeque<FutureObject>,
@@ -689,6 +777,34 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::needless_late_init)]
+    fn multi_pool_is_parallel() {
+        // notice that value is declared here
+        let mut value;
+
+        let mut executor: Cosync<(i32, i32), MultipleTasks> = Cosync::new_multiple();
+        executor.queue(move |mut input| async move {
+            let mut input = input.get();
+
+            assert_eq!((*input).0, 10);
+            (*input).0 = 30;
+        });
+
+        executor.queue(move |mut input| async move {
+            let mut input = input.get();
+
+            assert_eq!((*input).1, 20);
+            (*input).1 = 20;
+        });
+
+        // initialized here, after tasks are made
+        // (so code is correctly being deferred)
+        value = (10, 20);
+        executor.run_until_stall(&mut value);
+        assert_eq!(value, (30, 20));
+    }
+
+    #[test]
     fn run_until_stalled_stalls() {
         let mut cosync = Cosync::new();
 
@@ -710,6 +826,119 @@ mod tests {
     }
 
     #[test]
+    fn run_until_stall_multiple() {
+        // notice that value is declared here
+        let mut value = (10, 20);
+
+        let mut executor: Cosync<(i32, i32), MultipleTasks> = Cosync::new_multiple();
+        executor.queue(move |mut input| async move {
+            {
+                let mut input_guard = input.get();
+
+                assert_eq!((*input_guard).0, 10);
+                (*input_guard).0 = 30;
+            }
+
+            sleep_ticks(1).await;
+
+            {
+                let mut input_guard = input.get();
+                (*input_guard).0 = 40;
+            }
+        });
+
+        executor.queue(move |mut input| async move {
+            {
+                let mut input = input.get();
+
+                assert_eq!((*input).1, 20);
+                (*input).1 = 20;
+            }
+
+            sleep_ticks(1).await;
+
+            {
+                let mut input = input.get();
+
+                (*input).1 = 40;
+            }
+        });
+
+        executor.run_until_stall(&mut value);
+        assert_eq!(value, (30, 20));
+
+        executor.run_until_stall(&mut value);
+        assert_eq!(value, (40, 40));
+    }
+
+    #[test]
+    fn run_until_stall_weird() {
+        // notice that value is declared here
+        let mut value = (10, 20, 30);
+
+        let mut executor: Cosync<(i32, i32, i32), MultipleTasks> = Cosync::new_multiple();
+
+        executor.queue(move |mut input| async move {
+            {
+                let mut input = input.get();
+
+                assert_eq!(input.2, 30);
+                input.2 = 20;
+            }
+
+            sleep_ticks(1).await;
+
+            input.get().2 = 30;
+
+            sleep_ticks(1).await;
+
+            input.get().2 = 40;
+        });
+
+        executor.queue(move |mut input| async move {
+            {
+                let mut input_guard = input.get();
+
+                assert_eq!((*input_guard).0, 10);
+                (*input_guard).0 = 30;
+            }
+
+            sleep_ticks(1).await;
+
+            {
+                let mut input_guard = input.get();
+                (*input_guard).0 = 40;
+            }
+        });
+
+        executor.queue(move |mut input| async move {
+            {
+                let mut input = input.get();
+
+                assert_eq!((*input).1, 20);
+                (*input).1 = 20;
+            }
+
+            sleep_ticks(1).await;
+
+            {
+                let mut input = input.get();
+
+                (*input).1 = 40;
+            }
+        });
+
+        executor.run_until_stall(&mut value);
+        assert_eq!(value, (30, 20, 20));
+
+        executor.run_until_stall(&mut value);
+        assert_eq!(value, (40, 40, 30));
+
+        executor.run_until_stall(&mut value);
+        assert_eq!(value, (40, 40, 40));
+    }
+
+    #[test]
     #[allow(clippy::needless_late_init)]
     fn pool_remains_sequential() {
         // notice that value is declared here
@@ -717,7 +946,6 @@ mod tests {
 
         let mut executor: Cosync<i32> = Cosync::new();
         executor.queue(move |mut input| async move {
-            println!("starting task 1");
             *input.get() = 10;
 
             sleep_ticks(100).await;
@@ -734,6 +962,60 @@ mod tests {
     }
 
     #[test]
+    fn pool_remains_sequential_multi() {
+        let mut value = 0;
+
+        let mut executor: Cosync<i32, MultipleTasks> = Cosync::new_multiple();
+        executor.queue(move |mut input| async move {
+            *input.get() = 10;
+
+            input.queue(|mut input| async move {
+                println!("running this guy!!");
+
+                *input.get() = 20;
+
+                input.queue(|mut input| async move {
+                    println!("running final guy!!");
+
+                    *input.get() = 30;
+                });
+            });
+        });
+
+        executor.run_until_stall(&mut value);
+
+        assert_eq!(value, 30);
+    }
+
+    #[test]
+    fn multi_sequential_on_spawn() {
+        struct TestMe {
+            one: i32,
+            two: i32,
+        }
+
+        let mut value = TestMe { one: 0, two: 0 };
+
+        let mut executor: Cosync<TestMe, MultipleTasks> = Cosync::new_multiple();
+        executor.queue(move |mut input| async move {
+            input.get().one = 10;
+
+            input.queue(|mut input| async move {
+                println!("running this guy!!");
+
+                input.get().two = 20;
+            });
+
+            sleep_ticks(1).await;
+        });
+
+        executor.run_until_stall(&mut value);
+
+        assert_eq!(value.one, 10);
+        assert_eq!(value.two, 20);
+    }
+
+    #[test]
     #[allow(clippy::needless_late_init)]
     fn pool_is_still_sequential() {
         // notice that value is declared here
@@ -741,11 +1023,9 @@ mod tests {
 
         let mut executor: Cosync<i32> = Cosync::new();
         executor.queue(move |mut input| async move {
-            println!("starting task 1");
             *input.get() = 10;
 
             input.queue(move |mut input| async move {
-                println!("starting task 3");
                 assert_eq!(*input.get(), 20);
 
                 *input.get() = 30;
@@ -753,7 +1033,6 @@ mod tests {
         });
 
         executor.queue(move |mut input| async move {
-            println!("starting task 2");
             *input.get() = 20;
         });
 
@@ -772,7 +1051,6 @@ mod tests {
 
         let mut executor: Cosync<i32> = Cosync::new();
         executor.queue(move |mut input| async move {
-            println!("starting task 1");
             *input.get() = 10;
 
             sleep_ticks(1).await;
