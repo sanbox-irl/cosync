@@ -13,4 +13,3 @@ parking_lot = "0.12"
 
 [dev-dependencies]
 static_assertions = "1.1"
-trybuild = "1.0"

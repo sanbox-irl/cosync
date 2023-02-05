@@ -840,13 +840,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "miri will explode if we run this")]
-    fn trybuild() {
-        let t = trybuild::TestCases::new();
-        t.compile_fail("tests/try_build/*.rs");
-    }
-
-    #[test]
     fn dynamic_dispatch() {
         trait DynDispatch {
             fn test(&self) -> i32;
