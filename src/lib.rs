@@ -8,7 +8,6 @@
 mod futures;
 use crate::futures::{enter::enter, waker_ref, ArcWake, FuturesUnordered};
 
-use parking_lot::Mutex;
 use std::{
     collections::VecDeque,
     fmt,
@@ -58,12 +57,12 @@ impl<T: 'static + ?Sized> Cosync<T> {
     pub fn len(&self) -> usize {
         let one = self.is_running_any() as usize;
 
-        one + self.queue.lock().incoming.len()
+        one + unlock_mutex(&self.queue).incoming.len()
     }
 
     /// Returns true if no futures are being executed *and* there are no futures in the queue.
     pub fn is_empty(&self) -> bool {
-        !self.is_running_any() && self.queue.lock().incoming.is_empty()
+        !self.is_running_any() && unlock_mutex(&self.queue).incoming.is_empty()
     }
 
     /// Returns true if `cosync` has a `Pending` future. It is possible for
@@ -94,7 +93,7 @@ impl<T: 'static + ?Sized> Cosync<T> {
     pub fn unqueue_task(&mut self, task_id: CosyncTaskId) -> bool {
         let queue_handle = self.create_queue_handle().queue.upgrade().unwrap();
 
-        let incoming = &mut queue_handle.lock().incoming;
+        let incoming = &mut unlock_mutex(&queue_handle).incoming;
         let Some(index) = incoming.iter().position(|future_obj| future_obj.1 == task_id) else { return false };
         incoming.remove(index);
 
@@ -135,7 +134,7 @@ impl<T: 'static + ?Sized> Cosync<T> {
     /// Clears all queued tasks. Currently running tasks are unaffected. All `CosyncQueueHandler`s
     /// are still valid.
     pub fn clear_queue(&mut self) {
-        self.queue.lock().incoming.clear();
+        unlock_mutex(&self.queue).incoming.clear();
     }
 
     /// This clears all running tasks and all queued tasks.
@@ -143,7 +142,7 @@ impl<T: 'static + ?Sized> Cosync<T> {
     /// All `CosyncQueueHandler`s are still valid.
     pub fn clear(&mut self) {
         self.pool.clear();
-        self.queue.lock().incoming.clear();
+        unlock_mutex(&self.queue).incoming.clear();
     }
 
     /// Adds a new Task to the TaskQueue.
@@ -286,7 +285,7 @@ impl<T: 'static + ?Sized> Cosync<T> {
                 // the pool was empty already, or we just completed that task.
                 Poll::Ready(None) | Poll::Ready(Some(_)) => {
                     // grab our next task...
-                    if let Some(task) = self.queue.lock().incoming.pop_front() {
+                    if let Some(task) = unlock_mutex(&self.queue).incoming.pop_front() {
                         self.pool.push(task)
                     } else {
                         return Poll::Ready(());
@@ -382,7 +381,7 @@ impl<T: 'static + ?Sized> CosyncQueueHandle<T> {
                 task(sec).await;
             });
 
-            let mut mutex_lock = queue.lock();
+            let mut mutex_lock = unlock_mutex(&queue);
             let id = CosyncTaskId(mutex_lock.counter);
             // note: we use a wrapping add here just so we don't panic on release mode for...
             // absurd numbers of tasks.
@@ -404,7 +403,7 @@ impl<T: 'static + ?Sized> CosyncQueueHandle<T> {
     /// This returns `Some(true)` on success.
     pub fn unqueue_task(&mut self, task_id: CosyncTaskId) -> Option<bool> {
         self.queue.upgrade().map(|queue_handle| {
-            let incoming = &mut queue_handle.lock().incoming;
+            let incoming = &mut unlock_mutex(&queue_handle).incoming;
             let Some(index) = incoming.iter().position(|future_obj| future_obj.1 == task_id) else { return false };
             incoming.remove(index);
 
@@ -617,6 +616,21 @@ thread_local! {
         thread: thread::current(),
         unparked: AtomicBool::new(false),
     });
+}
+
+#[cfg(feature = "parking_lot")]
+type Mutex<T> = parking_lot::Mutex<T>;
+#[cfg(feature = "parking_lot")]
+fn unlock_mutex<T>(mutex: &Mutex<T>) -> parking_lot::MutexGuard<'_, T> {
+    mutex.lock()
+}
+
+#[cfg(not(feature = "parking_lot"))]
+type Mutex<T> = std::sync::Mutex<T>;
+
+#[cfg(not(feature = "parking_lot"))]
+fn unlock_mutex<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap()
 }
 
 #[cfg(test)]

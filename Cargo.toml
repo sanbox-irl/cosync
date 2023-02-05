@@ -9,7 +9,7 @@ description = "a single threaded, sequential, parameterized task pool for games"
 categories = ["game-development"]
 
 [dependencies]
-parking_lot = "0.12"
+parking_lot = { version = "0.12", optional = true }
 
 [dev-dependencies]
-static_assertions = "1.1"
+static_assertions = "1.1.0"
