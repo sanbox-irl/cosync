@@ -51,25 +51,30 @@ impl<T: 'static + ?Sized> Cosync<T> {
     }
 
     /// Returns the number of tasks queued. This *includes* the task currently being executed. Use
-    /// [is_executing] to see if there is a task currently being executed (ie, it returned `Pending`
+    /// [is_running] to see if there is a task currently being executed (ie, it returned `Pending`
     /// at some point in its execution).
     ///
-    /// [is_executing]: Self::is_executing
+    /// [is_running]: Self::is_running
     pub fn len(&self) -> usize {
-        let one = self.is_executing() as usize;
+        let one = self.is_running_any() as usize;
 
         one + self.queue.lock().incoming.len()
     }
 
     /// Returns true if no futures are being executed *and* there are no futures in the queue.
     pub fn is_empty(&self) -> bool {
-        !self.is_executing() && self.queue.lock().incoming.is_empty()
+        !self.is_running_any() && self.queue.lock().incoming.is_empty()
     }
 
     /// Returns true if `cosync` has a `Pending` future. It is possible for
     /// the `cosync` to have no `Pending` future, but to have tasks queued still.
-    pub fn is_executing(&self) -> bool {
+    pub fn is_running_any(&self) -> bool {
         !self.pool.is_empty()
+    }
+
+    /// Returns true if `cosync` is executing the given `CosyncTaskId`.
+    pub fn is_running(&self, task_id: CosyncTaskId) -> bool {
+        self.pool.iter().any(|v| v.1 == task_id)
     }
 
     /// Creates a queue handle which can be used to spawn tasks.
@@ -80,9 +85,10 @@ impl<T: 'static + ?Sized> Cosync<T> {
         }
     }
 
-    /// Tries to force unqueueing a task. If that task is already being ran, and you want to
-    /// external cancel it, run `force_clear_running` instead to clear all running tasks, or
-    /// `clear` to clear the entire Cosync.
+    /// Tries to force unqueueing a task.
+    ///
+    /// If that task is already being ran, and you want to external cancel it, run
+    /// `stop_running_task`. To see if a task is currently running, see `is_running`.
     ///
     /// This returns `true` on success and `false` on failure.
     pub fn unqueue_task(&mut self, task_id: CosyncTaskId) -> bool {
@@ -93,6 +99,26 @@ impl<T: 'static + ?Sized> Cosync<T> {
         incoming.remove(index);
 
         true
+    }
+
+    /// Stops a currently running task of the given id.
+    ///
+    /// If that task is only queued, but `run` hasn't been called on the Cosync, then it's only
+    /// queued -- run `unqueue_task` instead. To see if a task is currently running, see
+    /// `is_running`.
+    pub fn stop_running_task(&mut self, task_id: CosyncTaskId) -> bool {
+        // check the pool
+        for f in self.pool.iter_mut() {
+            if f.1 == task_id {
+                // we replace that task with an empty one instead. This is a hack...
+                // which might work?
+                f.0 = Box::pin(async move {});
+
+                return true;
+            }
+        }
+
+        false
     }
 
     /// Cosync keeps track of running task(s) and queued task(s). You can use this function to clear
@@ -923,5 +949,32 @@ mod tests {
         let success = cosync.unqueue_task(id);
         assert!(success);
         assert!(cosync.is_empty());
+    }
+
+    #[test]
+    fn stop_a_running_task() {
+        let mut cosync: Cosync<i32> = Cosync::new();
+
+        let id = cosync.queue(|mut input| async move {
+            *input.get() += 1;
+
+            sleep_ticks(1).await;
+
+            *input.get() += 1;
+        });
+
+        let mut value = 0;
+
+        cosync.run_until_stall(&mut value);
+
+        assert_eq!(value, 1);
+
+        let success = cosync.stop_running_task(id);
+        assert!(success);
+
+        cosync.run_until_stall(&mut value);
+
+        // it's still 1 because we cancelled the task which would have otherwise gotten it to 2
+        assert_eq!(value, 1);
     }
 }
