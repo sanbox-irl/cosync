@@ -52,25 +52,10 @@ const YIELD_EVERY: usize = 32;
 /// Futures managed by [`FuturesUnordered`] will only be polled when they
 /// generate wake-up notifications. This reduces the required amount of work
 /// needed to poll large numbers of futures.
-///
-/// [`FuturesUnordered`] can be filled by [`collect`](Iterator::collect)ing an
-/// iterator of futures into a [`FuturesUnordered`], or by
-/// [`push`](FuturesUnordered::push)ing futures onto an existing
-/// [`FuturesUnordered`]. When new futures are added,
-/// [`poll_next`](Stream::poll_next) must be called in order to begin receiving
-/// wake-ups for new futures.
-///
-/// Note that you can create a ready-made [`FuturesUnordered`] via the
-/// [`collect`](Iterator::collect) method, or you can start with an empty set
-/// with the [`FuturesUnordered::new`] constructor.
-///
-/// This type is only available when the `std` or `alloc` feature of this
-/// library is activated, and it is activated by default.
 #[must_use = "streams do nothing unless polled"]
 pub struct FuturesUnordered<Fut> {
     ready_to_run_queue: Arc<ReadyToRunQueue<Fut>>,
     pub(super) head_all: AtomicPtr<Task<Fut>>,
-    is_terminated: AtomicBool,
 }
 
 #[allow(clippy::non_send_fields_in_send_ty)]
@@ -116,7 +101,6 @@ impl<Fut> Unpin for FuturesUnordered<Fut> {}
 // whether the task is currently inserted in the atomic queue. When a wake-up
 // notification is received, the task will only be inserted into the ready to
 // run queue if it isn't inserted already.
-
 impl<Fut> Default for FuturesUnordered<Fut> {
     fn default() -> Self {
         Self::new()
@@ -150,7 +134,6 @@ impl<Fut> FuturesUnordered<Fut> {
         Self {
             head_all: AtomicPtr::new(ptr::null_mut()),
             ready_to_run_queue,
-            is_terminated: AtomicBool::new(false),
         }
     }
 
@@ -185,10 +168,6 @@ impl<Fut> FuturesUnordered<Fut> {
             queued: AtomicBool::new(true),
             ready_to_run_queue: Arc::downgrade(&self.ready_to_run_queue),
         });
-
-        // Reset the `is_terminated` flag if we've previously marked ourselves
-        // as terminated.
-        self.is_terminated.store(false, Relaxed);
 
         // Right now our task has a strong reference count of 1. We transfer
         // ownership of this reference count to our internal linked list
@@ -429,7 +408,6 @@ impl<Fut: Future> FuturesUnordered<Fut> {
                     if self.is_empty() {
                         // We can only consider ourselves terminated once we
                         // have yielded a `None`
-                        *self.is_terminated.get_mut() = true;
                         return Poll::Ready(None);
                     } else {
                         return Poll::Pending;
@@ -570,8 +548,6 @@ impl<Fut> FuturesUnordered<Fut> {
 
         // we just cleared all the tasks, and we have &mut self, so this is safe.
         unsafe { self.ready_to_run_queue.clear() };
-
-        self.is_terminated.store(false, Relaxed);
     }
 
     fn clear_head_all(&mut self) {
