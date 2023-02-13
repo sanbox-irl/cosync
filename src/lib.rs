@@ -3,8 +3,8 @@
 #![deny(missing_docs)]
 #![warn(clippy::dbg_macro)]
 #![cfg_attr(not(test), warn(clippy::print_stdout))]
-// #![warn(clippy::missing_errors_doc)]
-// #![warn(clippy::missing_panics_doc)]
+#![warn(clippy::missing_errors_doc)]
+#![warn(clippy::missing_panics_doc)]
 #![warn(clippy::todo)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
@@ -110,9 +110,7 @@ impl<T: 'static + ?Sized, M: TaskManager> Cosync<T, M> {
     ///
     /// This returns `true` on success and `false` on failure.
     pub fn unqueue_task(&mut self, task_id: CosyncTaskId) -> bool {
-        let queue_handle = self.create_queue_handle().queue.upgrade().unwrap();
-
-        let incoming = &mut unlock_mutex(&queue_handle).incoming;
+        let incoming = &mut unlock_mutex(&self.queue).incoming;
         let Some(index) = incoming.iter().position(|future_obj| future_obj.1 == task_id) else { return false };
         incoming.remove(index);
 
@@ -170,10 +168,7 @@ impl<T: 'static + ?Sized, M: TaskManager> Cosync<T, M> {
         Task: FnOnce(CosyncInput<T>) -> Out + Send + 'static,
         Out: Future<Output = ()> + Send,
     {
-        let queue_handle = self.create_queue_handle();
-
-        // panics: we can unwrap here because know that the cosync exists because we are the cosync.
-        queue_handle.queue(task).unwrap()
+        raw_queue(&self.queue, task, self.data)
     }
 
     /// Run all tasks in the queue to completion. If a task won't complete, this will infinitely
@@ -369,27 +364,7 @@ impl<T: 'static + ?Sized> CosyncQueueHandle<T> {
         Task: FnOnce(CosyncInput<T>) -> Out + Send + 'static,
         Out: Future<Output = ()> + Send,
     {
-        self.queue.upgrade().map(|queue| {
-            // force the future to move...
-            let task = task;
-            let sec = CosyncInput(CosyncQueueHandle {
-                heap_ptr: self.heap_ptr,
-                queue: self.queue.clone(),
-            });
-
-            let our_cb = Box::pin(async move {
-                task(sec).await;
-            });
-
-            let mut mutex_lock = unlock_mutex(&queue);
-            let id = CosyncTaskId(mutex_lock.counter);
-            // note: we use a wrapping add here just so we don't panic on release mode for...
-            // absurd numbers of tasks.
-            mutex_lock.counter = mutex_lock.counter.wrapping_add(1);
-            mutex_lock.incoming.push_back(FutureObject(our_cb, id));
-
-            id
-        })
+        self.queue.upgrade().map(|queue| raw_queue(&queue, task, self.heap_ptr))
     }
 
     /// Tries to force unqueueing a task.
@@ -410,6 +385,36 @@ impl<T: 'static + ?Sized> CosyncQueueHandle<T> {
             true
         })
     }
+}
+
+fn raw_queue<T: ?Sized + 'static, Task, Out>(
+    queue: &Arc<Mutex<IncomingQueue>>,
+    task: Task,
+    heap_ptr: *mut Option<*mut T>,
+) -> CosyncTaskId
+where
+    Task: FnOnce(CosyncInput<T>) -> Out + Send + 'static,
+    Out: Future<Output = ()> + Send,
+{
+    // force the future to move...
+    let task = task;
+    let sec = CosyncInput(CosyncQueueHandle {
+        heap_ptr,
+        queue: Arc::downgrade(queue),
+    });
+
+    let our_cb = Box::pin(async move {
+        task(sec).await;
+    });
+
+    let mut mutex_lock = unlock_mutex(queue);
+    let id = CosyncTaskId(mutex_lock.counter);
+    // note: we use a wrapping add here just so we don't panic on release mode for...
+    // absurd numbers of tasks.
+    mutex_lock.counter = mutex_lock.counter.wrapping_add(1);
+    mutex_lock.incoming.push_back(FutureObject(our_cb, id));
+
+    id
 }
 
 // safety:
@@ -438,6 +443,11 @@ pub struct CosyncInput<T: ?Sized>(CosyncQueueHandle<T>);
 
 impl<T: 'static + ?Sized> CosyncInput<T> {
     /// Gets the underlying [CosyncInputGuard].
+    ///
+    /// # Panics
+    ///
+    /// This can panic if you move the `CosyncInput` out of a closure (with, eg an mspc channel). Do
+    /// not do that.
     pub fn get(&mut self) -> CosyncInputGuard<'_, T> {
         // if you find this guard, it means that you somehow moved the `CosyncInput` out of
         // the closure, and then dropped the `Cosync`. Why would you do that? Don't do that.
