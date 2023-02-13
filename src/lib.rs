@@ -1,6 +1,11 @@
 #![doc = include_str!("../README.md")]
 #![deny(rust_2018_idioms)]
 #![deny(missing_docs)]
+#![warn(clippy::dbg_macro)]
+#![cfg_attr(not(test), warn(clippy::print_stdout))]
+// #![warn(clippy::missing_errors_doc)]
+// #![warn(clippy::missing_panics_doc)]
+#![warn(clippy::todo)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
 // this is vendored code from the `futures-rs` crate, to avoid
@@ -71,9 +76,7 @@ impl<T: 'static + ?Sized, M: TaskManager> Cosync<T, M> {
     ///
     /// [is_running]: Self::is_running
     pub fn len(&self) -> usize {
-        let one = self.is_running_any() as usize;
-
-        one + unlock_mutex(&self.queue).incoming.len()
+        self.pool.len() + unlock_mutex(&self.queue).incoming.len()
     }
 
     /// Returns true if no futures are being executed *and* there are no futures in the queue.
@@ -596,6 +599,7 @@ pub struct SingleTask;
 impl TaskManager for SingleTask {
     fn poll_pool<T: ?Sized>(cosync: &mut Cosync<T, Self>, cx: &mut Context<'_>) -> Poll<()> {
         loop {
+            cosync.pool.increment_counter();
             // try to execute the next ready future
             let pinned_pool = Pin::new(&mut cosync.pool);
             let ret = pinned_pool.poll_next(cx);
@@ -605,7 +609,7 @@ impl TaskManager for SingleTask {
                 // this means an inner task is pending
                 Poll::Pending => return Poll::Pending,
                 // the pool was empty already, or we just completed that task.
-                Poll::Ready(None) | Poll::Ready(Some(())) => {
+                Poll::Ready(()) => {
                     // grab our next task...
                     if let Some(task) = unlock_mutex(&cosync.queue).incoming.pop_front() {
                         cosync.pool.push(task);
@@ -630,20 +634,29 @@ pub struct MultipleTasks;
 
 impl TaskManager for MultipleTasks {
     fn poll_pool<T: ?Sized>(cosync: &mut Cosync<T, Self>, cx: &mut Context<'_>) -> Poll<()> {
-        fn dump_tasks<T: ?Sized>(cosync: &mut Cosync<T, MultipleTasks>) {
+        // dump all the tasks in (scope so we don't own this mutex)
+        {
             let mut queue = unlock_mutex(&cosync.queue);
             for task in queue.incoming.drain(..) {
                 cosync.pool.push(task);
             }
         }
 
-        // loop {
-        // grab all our next tasks
-        dump_tasks(cosync);
+        cosync.pool.increment_counter();
+        loop {
+            let pinned_pool = Pin::new(&mut cosync.pool);
+            let output = pinned_pool.poll_next(cx);
 
-        // and now we vibe.
-        let pinned_pool = Pin::new(&mut cosync.pool);
-        pinned_pool.poll_next(cx).map(|_| ())
+            // do we have new tasks? we can take care of that now too
+            let mut queue = unlock_mutex(&cosync.queue);
+            if queue.incoming.is_empty() {
+                break output;
+            }
+
+            for task in queue.incoming.drain(..) {
+                cosync.pool.push(task);
+            }
+        }
 
         // match ret {
         //     // this means an inner task is pending
@@ -1001,8 +1014,7 @@ mod tests {
             input.get().one = 10;
 
             input.queue(|mut input| async move {
-                println!("running this guy!!");
-
+                println!("running?/");
                 input.get().two = 20;
             });
 

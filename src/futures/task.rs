@@ -4,7 +4,7 @@ use std::{
     cell::UnsafeCell,
     sync::{
         atomic::{
-            AtomicBool, AtomicPtr,
+            AtomicBool, AtomicPtr, AtomicUsize,
             Ordering::{self, SeqCst},
         },
         Arc, Weak,
@@ -35,6 +35,9 @@ pub(super) struct Task<Fut> {
 
     // Whether or not this task is currently in the ready to run queue
     pub(super) queued: AtomicBool,
+
+    // Checks if it was polled each poll cycle.
+    pub(super) last_polled: AtomicUsize,
 }
 
 // `Task` can be sent across threads safely because it ensures that
@@ -50,7 +53,9 @@ impl<Fut> ArcWake for Task<Fut> {
     fn wake_by_ref(arc_self: &Arc<Self>) {
         let inner = match arc_self.ready_to_run_queue.upgrade() {
             Some(inner) => inner,
-            None => return,
+            None => {
+                return;
+            }
         };
 
         // It's our job to enqueue this task it into the ready to run queue. To
