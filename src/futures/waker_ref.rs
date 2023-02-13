@@ -45,7 +45,7 @@ impl Deref for WakerRef<'_> {
 pub fn waker_ref<T: ArcWake>(this: &Arc<T>) -> WakerRef<'_> {
     // simply copy the pointer instead of using Arc::into_raw,
     // as we don't actually keep a refcount by using ManuallyDrop.<
-    let ptr = (&**this as *const T) as *const ();
+    let ptr = Arc::as_ptr(this) as *const ();
 
     let waker = ManuallyDrop::new(unsafe { Waker::from_raw(RawWaker::new(ptr, waker_vtable::<T>())) });
     WakerRef::new_unowned(waker)
