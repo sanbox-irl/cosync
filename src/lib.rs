@@ -13,6 +13,9 @@
 mod futures;
 use crate::futures::{enter::enter, waker_ref, ArcWake, FuturesUnordered};
 
+mod serial;
+pub use serial::SerialCosync;
+
 use std::{
     collections::VecDeque,
     fmt,
@@ -53,9 +56,7 @@ impl<T: 'static + ?Sized> Cosync<T> {
             data: Box::into_raw(Box::new(None)),
         }
     }
-}
 
-impl<T: 'static + ?Sized> Cosync<T> {
     /// Returns the number of tasks queued. This *includes* the task currently being executed. Use
     /// [is_running] to see if there is a task currently being executed (ie, it returned `Pending`
     /// at some point in its execution).
@@ -182,43 +183,7 @@ impl<T: 'static + ?Sized> Cosync<T> {
     /// The function will block the calling thread until *all* tasks in the pool
     /// are complete, including any spawned while running existing tasks.
     pub fn run_blocking(&mut self, parameter: &mut T) {
-        // SAFETY: we own this box and make sure it's safe until we drop,
-        // so the pointer is still valid if we have an `&mut self`
-        unsafe {
-            *self.data = Some(parameter as *mut _);
-        }
-
-        let _enter = enter().expect(
-            "cannot execute `LocalPool` executor from within \
-             another executor",
-        );
-
-        CURRENT_THREAD_NOTIFY.with(|thread_notify| {
-            let waker = waker_ref::waker_ref(thread_notify);
-            let mut cx = Context::from_waker(&waker);
-            loop {
-                if let Poll::Ready(t) = poll_pool(self, &mut cx) {
-                    return t;
-                }
-                // Consume the wakeup that occurred while executing `f`, if any.
-                let unparked = thread_notify.unparked.swap(false, Ordering::Acquire);
-                if !unparked {
-                    // No wakeup occurred. It may occur now, right before parking,
-                    // but in that case the token made available by `unpark()`
-                    // is guaranteed to still be available and `park()` is a no-op.
-                    thread::park();
-                    // When the thread is unparked, `unparked` will have been set
-                    // and needs to be unset before the next call to `f` to avoid
-                    // a redundant loop iteration.
-                    thread_notify.unparked.store(false, Ordering::Release);
-                }
-            }
-        });
-
-        // safety: see above
-        unsafe {
-            *self.data = None;
-        }
+        run_blocking(self.data, parameter, |ctx| self.poll_pool(ctx));
     }
 
     /// Runs all tasks in the queue and returns if no more progress can be made
@@ -251,31 +216,38 @@ impl<T: 'static + ?Sized> Cosync<T> {
     /// of the pool's run or poll methods. While the function is running, all tasks
     /// in the pool will try to make progress.
     pub fn run_until_stall(&mut self, parameter: &mut T) {
-        // SAFETY: we own this box and make sure it's safe until we drop,
-        // so the pointer is still valid if we have an `&mut self`
-        unsafe {
-            *self.data = Some(parameter as *mut _);
+        run_until_stall(self.data, parameter, |ctx| self.poll_pool(ctx))
+    }
+
+    fn poll_pool(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        // dump all the tasks in
+        {
+            let mut queue = unlock_mutex(&self.queue);
+            for task in queue.incoming.drain(..) {
+                self.pool.push(task);
+            }
         }
 
-        let _enter = enter().expect(
-            "cannot execute `LocalPool` executor from within \
-             another executor",
-        );
+        self.pool.increment_counter();
+        loop {
+            let pinned_pool = Pin::new(&mut self.pool);
+            let output = pinned_pool.poll_next(cx);
 
-        let _ = CURRENT_THREAD_NOTIFY.with(|thread_notify| {
-            let waker = waker_ref::waker_ref(thread_notify);
-            let mut cx = Context::from_waker(&waker);
-            poll_pool(self, &mut cx)
-        });
+            // do we have new tasks? we can take care of that now too
+            let mut queue = unlock_mutex(&self.queue);
+            if queue.incoming.is_empty() {
+                break output;
+            }
 
-        // SAFETY: same as above, no one has deallocated this box
-        unsafe {
-            *self.data = None;
+            // if we have new tasks, time to go around the horn again
+            for task in queue.incoming.drain(..) {
+                self.pool.push(task);
+            }
         }
     }
 }
 
-impl<T: 'static> Default for Cosync<T> {
+impl<T: ?Sized + 'static> Default for Cosync<T> {
     fn default() -> Self {
         Self::new()
     }
@@ -291,7 +263,6 @@ impl<T: ?Sized> Drop for Cosync<T> {
     }
 }
 
-#[allow(clippy::non_send_fields_in_send_ty)]
 unsafe impl<T: Send + ?Sized> Send for Cosync<T> {}
 unsafe impl<T: Sync + ?Sized> Sync for Cosync<T> {}
 impl<T> Unpin for Cosync<T> {}
@@ -368,6 +339,78 @@ impl<T: 'static + ?Sized> CosyncQueueHandle<T> {
 
             true
         })
+    }
+}
+
+fn run_blocking<T: ?Sized + 'static>(
+    heap_ptr: *mut Option<*mut T>,
+    parameter: &mut T,
+    mut cback: impl FnMut(&mut Context<'_>) -> Poll<()>,
+) {
+    // SAFETY: we own this box and make sure it's safe until we drop,
+    // so the pointer is still valid if we have an `&mut self`
+    unsafe {
+        *heap_ptr = Some(parameter as *mut _);
+    }
+
+    let _enter = enter().expect(
+        "cannot execute `LocalPool` executor from within \
+         another executor",
+    );
+
+    CURRENT_THREAD_NOTIFY.with(|thread_notify| {
+        let waker = waker_ref::waker_ref(thread_notify);
+        let mut cx = Context::from_waker(&waker);
+        loop {
+            if let Poll::Ready(t) = cback(&mut cx) {
+                return t;
+            }
+            // Consume the wakeup that occurred while executing `f`, if any.
+            let unparked = thread_notify.unparked.swap(false, Ordering::Acquire);
+            if !unparked {
+                // No wakeup occurred. It may occur now, right before parking,
+                // but in that case the token made available by `unpark()`
+                // is guaranteed to still be available and `park()` is a no-op.
+                thread::park();
+                // When the thread is unparked, `unparked` will have been set
+                // and needs to be unset before the next call to `f` to avoid
+                // a redundant loop iteration.
+                thread_notify.unparked.store(false, Ordering::Release);
+            }
+        }
+    });
+
+    // safety: see above
+    unsafe {
+        *heap_ptr = None;
+    }
+}
+
+fn run_until_stall<T: ?Sized>(
+    heap_ptr: *mut Option<*mut T>,
+    parameter: &mut T,
+    mut cback: impl FnMut(&mut Context<'_>) -> Poll<()>,
+) {
+    // SAFETY: we own this box and make sure it's safe until we drop,
+    // so the pointer is still valid if we have an `&mut self`
+    unsafe {
+        *heap_ptr = Some(parameter as *mut _);
+    }
+
+    let _enter = enter().expect(
+        "cannot execute `LocalPool` executor from within \
+         another executor",
+    );
+
+    let _ = CURRENT_THREAD_NOTIFY.with(|thread_notify| {
+        let waker = waker_ref::waker_ref(thread_notify);
+        let mut cx = Context::from_waker(&waker);
+        cback(&mut cx)
+    });
+
+    // SAFETY: same as above, no one has deallocated this box
+    unsafe {
+        *heap_ptr = None;
     }
 }
 
@@ -583,32 +626,6 @@ impl CosyncTaskId {
     /// Creates a CosyncTaskId set to `usize::MAX`. Theoretically, this could refer to a valid task
     /// but would be exceedingly unlikely.
     pub const DANGLING: CosyncTaskId = CosyncTaskId(usize::MAX);
-}
-
-fn poll_pool<T: ?Sized>(cosync: &mut Cosync<T>, cx: &mut Context<'_>) -> Poll<()> {
-    // dump all the tasks in (scope so we don't own this mutex)
-    {
-        let mut queue = unlock_mutex(&cosync.queue);
-        for task in queue.incoming.drain(..) {
-            cosync.pool.push(task);
-        }
-    }
-
-    cosync.pool.increment_counter();
-    loop {
-        let pinned_pool = Pin::new(&mut cosync.pool);
-        let output = pinned_pool.poll_next(cx);
-
-        // do we have new tasks? we can take care of that now too
-        let mut queue = unlock_mutex(&cosync.queue);
-        if queue.incoming.is_empty() {
-            break output;
-        }
-
-        for task in queue.incoming.drain(..) {
-            cosync.pool.push(task);
-        }
-    }
 }
 
 #[derive(Debug, Default)]
