@@ -22,11 +22,6 @@ impl<T: ?Sized + 'static> SerialCosync<T> {
     }
 
     /// Returns the `number of tasks queued + 1` if there is any task being executed.
-    ///
-    /// This *includes* the task currently being executed. Use [is_running_any] to see if there is a
-    /// task currently being executed.
-    ///
-    /// [is_running_any]: Self::is_running_any
     pub fn len(&self) -> usize {
         self.is_running_any() as usize + unlock_mutex(&self.0.queue).incoming.len()
     }
@@ -42,9 +37,10 @@ impl<T: ?Sized + 'static> SerialCosync<T> {
         self.0.is_running_any()
     }
 
-    /// Returns true if `SerialCosync` is executing the given `CosyncTaskId`.
-    pub fn is_running(&self, task_id: CosyncTaskId) -> bool {
-        self.0.is_running(task_id)
+    /// Returns the id of the current task, if it is running.
+    pub fn current_task_id(&self) -> Option<CosyncTaskId> {
+        // we ensure that pool's length is always 1 so this will be the only task
+        self.0.pool.iter().next().map(|v| v.1)
     }
 
     /// Creates a queue handle which can be used to spawn tasks.
@@ -59,59 +55,33 @@ impl<T: ?Sized + 'static> SerialCosync<T> {
     ///
     /// This returns `true` on success and `false` on failure.
     pub fn unqueue_task(&mut self, task_id: CosyncTaskId) -> bool {
-        let incoming = &mut unlock_mutex(&self.queue).incoming;
+        let incoming = &mut unlock_mutex(&self.0.queue).incoming;
         let Some(index) = incoming.iter().position(|future_obj| future_obj.1 == task_id) else { return false };
         incoming.remove(index);
 
         true
     }
 
-    /// Stops a currently running task of the given id.
-    ///
-    /// If that task is only queued, but `run` hasn't been called on the Cosync, then it's only
-    /// queued -- run `unqueue_task` instead. To see if a task is currently running, see
-    /// `is_running`.
-    pub fn stop_running_task(&mut self, task_id: CosyncTaskId) -> bool {
-        // check the pool
-        for f in self.pool.iter_mut() {
-            if f.1 == task_id {
-                // we replace that task with an empty one instead. This is a hack...
-                // which might work?
-                f.0 = Box::pin(async move {});
-
-                return true;
-            }
-        }
-
-        false
+    /// Stops the current running task.
+    pub fn stop_running_task(&mut self) {
+        self.0.pool.clear();
     }
 
-    /// Cosync keeps track of running task(s) and queued task(s). You can use this function to clear
-    /// only the running tasks. This generally is a bad idea, producing complicated logic. In
-    /// general, it's much easier to cancel internally in a future.
-    ///
-    /// For Cosync's which are `PollMultiple`, this will cancel all running tasks. It is not
-    /// possible to only cancel a single running task right now. If you need that, please submit
-    /// an issue.
-    pub fn clear_running(&mut self) {
-        self.pool.clear();
-    }
-
-    /// Clears all queued tasks. Currently running tasks are unaffected. All `CosyncQueueHandler`s
+    /// Clears all queued tasks. The running task is unaffected. All `CosyncQueueHandler`s
     /// are still valid.
     pub fn clear_queue(&mut self) {
-        unlock_mutex(&self.queue).incoming.clear();
+        unlock_mutex(&self.0.queue).incoming.clear();
     }
 
     /// This clears all running tasks and all queued tasks.
     ///
     /// All `CosyncQueueHandler`s are still valid.
     pub fn clear(&mut self) {
-        self.pool.clear();
-        unlock_mutex(&self.queue).incoming.clear();
+        self.0.clear();
     }
 
-    /// Adds a new Task into the Pool directly.
+    /// Adds a new Task into the Queue. When `run_until` is called, if there are no running tasks,
+    /// it will be de-queued and ran at `run_until`.
     pub fn queue<Task, Out>(&mut self, task: Task) -> CosyncTaskId
     where
         Task: FnOnce(CosyncInput<T>) -> Out + Send + 'static,
@@ -126,13 +96,21 @@ impl<T: ?Sized + 'static> SerialCosync<T> {
         id
     }
 
-    /// Runs all tasks to completion, possibly looping forever.
+    /// Runs tasks to completion, possibly looping forever.
+    ///
+    /// If a task is completed, progress will be made on the *next* task.
+    ///
+    /// This function only returns when all tasks in the pool and in the queue are completed.
     pub fn run_blocking(&mut self, parameter: &mut T) {
         super::run_blocking(self.0.data, parameter, |ctx| Self::poll_pool(&mut self.0, ctx));
     }
 
-    /// Runs all tasks in the queue and returns if no more progress can be made
+    /// Runs tasks in the queue and returns if no more progress can be made
     /// on any task.
+    ///
+    /// If a task is completed, progress will be made on the *next* task.
+    ///
+    /// This function returns when any task returns `Poll::Pending`.
     pub fn run_until_stall(&mut self, parameter: &mut T) {
         super::run_until_stall(self.0.data, parameter, |ctx| Self::poll_pool(&mut self.0, ctx))
     }
@@ -167,5 +145,68 @@ impl<T: ?Sized + 'static> SerialCosync<T> {
 impl<T: ?Sized + 'static> Default for SerialCosync<T> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::sleep_ticks;
+
+    use super::*;
+
+    #[test]
+    #[allow(clippy::needless_late_init)]
+    fn pool_remains_sequential() {
+        // notice that value is declared here
+        let mut value;
+
+        let mut executor: SerialCosync<i32> = SerialCosync::new();
+        executor.queue(move |mut input| async move {
+            *input.get() = 10;
+
+            sleep_ticks(100).await;
+
+            *input.get() = 20;
+        });
+
+        executor.queue(move |mut input| async move {
+            assert_eq!(*input.get(), 20);
+        });
+
+        value = 0;
+        executor.run_until_stall(&mut value);
+    }
+
+    #[test]
+    fn cancelling_a_task() {
+        let mut cosync: SerialCosync<i32> = SerialCosync::new();
+
+        cosync.queue(|mut input| async move {
+            *input.get() += 1;
+
+            sleep_ticks(1).await;
+
+            *input.get() += 1;
+        });
+
+        let mut value = 0;
+
+        cosync.run_until_stall(&mut value);
+
+        assert_eq!(value, 1);
+
+        cosync.stop_running_task();
+
+        cosync.run_until_stall(&mut value);
+
+        // it's still 1 because we cancelled the task which would have otherwise gotten it to 2
+        assert_eq!(value, 1);
+
+        assert!(cosync.is_empty());
+        let id = cosync.queue(|_| async {});
+        assert_eq!(cosync.len(), 1);
+        let success = cosync.unqueue_task(id);
+        assert!(success);
+        assert!(cosync.is_empty());
     }
 }

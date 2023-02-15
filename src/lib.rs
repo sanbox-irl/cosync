@@ -149,7 +149,8 @@ impl<T: 'static + ?Sized> Cosync<T> {
         unlock_mutex(&self.queue).incoming.clear();
     }
 
-    /// Adds a new Task into the Pool directly.
+    /// Adds a new Task into the Pool directly. This does not queue it at all, for the sake of
+    /// saving a mutex unlock call.
     pub fn queue<Task, Out>(&mut self, task: Task) -> CosyncTaskId
     where
         Task: FnOnce(CosyncInput<T>) -> Out + Send + 'static,
@@ -1165,60 +1166,4 @@ mod tests {
         // it's still 1 because we cancelled the task which would have otherwise gotten it to 2
         assert_eq!(value, 1);
     }
-
-    // #[test]
-    // #[allow(clippy::needless_late_init)]
-    // fn pool_remains_sequential() {
-    //     // notice that value is declared here
-    //     let mut value;
-
-    //     let mut executor: Cosync<i32> = Cosync::new();
-    //     executor.queue(move |mut input| async move {
-    //         *input.get() = 10;
-
-    //         sleep_ticks(100).await;
-
-    //         *input.get() = 20;
-    //     });
-
-    //     executor.queue(move |mut input| async move {
-    //         assert_eq!(*input.get(), 20);
-    //     });
-
-    //     value = 0;
-    //     executor.run_until_stall(&mut value);
-    // }
-
-    // #[test]
-    // fn cancelling_a_task() {
-    //     let mut cosync: Cosync<i32> = Cosync::new();
-
-    //     cosync.queue(|mut input| async move {
-    //         *input.get() += 1;
-
-    //         sleep_ticks(1).await;
-
-    //         *input.get() += 1;
-    //     });
-
-    //     let mut value = 0;
-
-    //     cosync.run_until_stall(&mut value);
-
-    //     assert_eq!(value, 1);
-
-    //     cosync.clear_running();
-
-    //     cosync.run_until_stall(&mut value);
-
-    //     // it's still 1 because we cancelled the task which would have otherwise gotten it to 2
-    //     assert_eq!(value, 1);
-
-    //     assert!(cosync.is_empty());
-    //     let id = cosync.queue(|_| async {});
-    //     assert_eq!(cosync.len(), 1);
-    //     let success = cosync.unqueue_task(id);
-    //     assert!(success);
-    //     assert!(cosync.is_empty());
-    // }
 }
