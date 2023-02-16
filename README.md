@@ -11,7 +11,7 @@ This crate provides a single-threaded, parameterized async runtime. In other wor
 To install, add the following to your Cargo.toml:
 
 ```toml
-cosync = { git = https://github.com/sanbox-irl/cosync }
+cosync = { git = "https://github.com/sanbox-irl/cosync" }
 ```
 
 or run
