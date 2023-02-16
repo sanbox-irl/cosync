@@ -32,7 +32,7 @@ impl<T: ?Sized + 'static> SerialCosync<T> {
     }
 
     /// Returns true if the `SerialCosync` is executing a task. In general, that means the task has
-    /// return `Pending` at least once after called `run_until_stall`.
+    /// return `Pending` at least once after called `run`.
     pub fn is_running_any(&self) -> bool {
         self.0.is_running_any()
     }
@@ -80,8 +80,8 @@ impl<T: ?Sized + 'static> SerialCosync<T> {
         self.0.clear();
     }
 
-    /// Adds a new Task into the Queue. When `run_until` is called, if there are no running tasks,
-    /// it will be de-queued and ran at `run_until`.
+    /// Adds a new Task into the Queue. When `run` is called, if there are no running tasks,
+    /// it will be de-queued and ran at `run`.
     pub fn queue<Task, Out>(&mut self, task: Task) -> CosyncTaskId
     where
         Task: FnOnce(CosyncInput<T>) -> Out + Send + 'static,
@@ -111,8 +111,14 @@ impl<T: ?Sized + 'static> SerialCosync<T> {
     /// If a task is completed, progress will be made on the *next* task.
     ///
     /// This function returns when any task returns `Poll::Pending`.
+    pub fn run(&mut self, parameter: &mut T) {
+        super::run(self.0.data, parameter, |ctx| Self::poll_pool(&mut self.0, ctx))
+    }
+
+    #[deprecated(note = "use `run` instead", since = "0.3.0")]
+    #[doc(hidden)]
     pub fn run_until_stall(&mut self, parameter: &mut T) {
-        super::run_until_stall(self.0.data, parameter, |ctx| Self::poll_pool(&mut self.0, ctx))
+        self.run(parameter)
     }
 
     fn poll_pool(cosync: &mut Cosync<T>, cx: &mut Context<'_>) -> Poll<()> {
@@ -174,7 +180,7 @@ mod tests {
         });
 
         value = 0;
-        executor.run_until_stall(&mut value);
+        executor.run(&mut value);
     }
 
     #[test]
@@ -191,13 +197,13 @@ mod tests {
 
         let mut value = 0;
 
-        cosync.run_until_stall(&mut value);
+        cosync.run(&mut value);
 
         assert_eq!(value, 1);
 
         cosync.stop_running_task();
 
-        cosync.run_until_stall(&mut value);
+        cosync.run(&mut value);
 
         // it's still 1 because we cancelled the task which would have otherwise gotten it to 2
         assert_eq!(value, 1);

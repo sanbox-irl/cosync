@@ -164,7 +164,7 @@ impl<T: 'static + ?Sized> Cosync<T> {
     }
 
     /// Run all tasks in the queue to completion. If a task won't complete, this will infinitely
-    /// retry it. You probably want `run_until_stall`, which returns once a task returns
+    /// retry it. You probably want `run`, which returns once a task returns
     /// `Polling::Pending`.
     ///
     /// ```
@@ -197,7 +197,7 @@ impl<T: 'static + ?Sized> Cosync<T> {
     /// cosync.queue(move |mut input| async move {
     ///     *input.get() = 10;
     ///     // this will make the executor stall for a call
-    ///     // we call `run_until_stall` an additional time,
+    ///     // we call `run` an additional time,
     ///     // so we'll complete this 1 tick sleep.
     ///     sleep_ticks(1).await;
     ///
@@ -205,9 +205,9 @@ impl<T: 'static + ?Sized> Cosync<T> {
     /// });
     ///
     /// let mut value = 0;
-    /// cosync.run_until_stall(&mut value);
+    /// cosync.run(&mut value);
     /// assert_eq!(value, 10);
-    /// cosync.run_until_stall(&mut value);
+    /// cosync.run(&mut value);
     /// assert_eq!(value, 20);
     /// ```
     ///
@@ -216,8 +216,14 @@ impl<T: 'static + ?Sized> Cosync<T> {
     /// remaining incomplete tasks in the pool can continue with further use of one
     /// of the pool's run or poll methods. While the function is running, all tasks
     /// in the pool will try to make progress.
+    pub fn run(&mut self, parameter: &mut T) {
+        run(self.data, parameter, |ctx| self.poll_pool(ctx))
+    }
+
+    #[deprecated(note = "use `run` instead", since = "0.3.0")]
+    #[doc(hidden)]
     pub fn run_until_stall(&mut self, parameter: &mut T) {
-        run_until_stall(self.data, parameter, |ctx| self.poll_pool(ctx))
+        self.run(parameter)
     }
 
     fn poll_pool(&mut self, cx: &mut Context<'_>) -> Poll<()> {
@@ -387,7 +393,7 @@ fn run_blocking<T: ?Sized + 'static>(
     }
 }
 
-fn run_until_stall<T: ?Sized>(
+fn run<T: ?Sized>(
     heap_ptr: *mut Option<*mut T>,
     parameter: &mut T,
     mut cback: impl FnMut(&mut Context<'_>) -> Poll<()>,
@@ -564,9 +570,9 @@ impl fmt::Debug for FutureObject {
     }
 }
 
-/// Sleep the `Cosync` for a given number of calls to `run_until_stall`.
+/// Sleep the `Cosync` for a given number of calls to `run`.
 ///
-/// If you run `run_until_stall` once per tick in your main loop, then
+/// If you run `run` once per tick in your main loop, then
 /// this will sleep for that number of ticks.
 pub fn sleep_ticks(ticks: usize) -> SleepForTick {
     SleepForTick::new(ticks)
@@ -697,7 +703,7 @@ mod tests {
         cosync.queue(|_i| async move {
             println!("actual task body!");
         });
-        cosync.run_until_stall(&mut value);
+        cosync.run(&mut value);
     }
 
     #[test]
@@ -719,7 +725,7 @@ mod tests {
 
             // this will make the executor sleep, stall,
             // and exit out of this tick
-            // we call `run_until_stall` an additional time,
+            // we call `run` an additional time,
             // so we'll complete this 1 tick sleep.
             sleep_ticks(1).await;
 
@@ -731,9 +737,9 @@ mod tests {
         // initialized here, after tasks are made
         // (so code is correctly being deferred)
         value = 10;
-        executor.run_until_stall(&mut value);
+        executor.run(&mut value);
         value = 30;
-        executor.run_until_stall(&mut value);
+        executor.run(&mut value);
         assert_eq!(value, 0);
     }
 
@@ -761,18 +767,18 @@ mod tests {
         // initialized here, after tasks are made
         // (so code is correctly being deferred)
         value = (10, 20);
-        executor.run_until_stall(&mut value);
+        executor.run(&mut value);
         assert_eq!(value, (30, 20));
     }
 
     #[test]
-    fn run_until_stalled_stalls() {
+    fn run_stalls() {
         let mut cosync = Cosync::new();
 
         cosync.queue(move |mut input| async move {
             *input.get() = 10;
             // this will make the executor stall for a call
-            // we call `run_until_stall` an additional time,
+            // we call `run` an additional time,
             // so we'll complete this 1 tick sleep.
             sleep_ticks(1).await;
 
@@ -780,14 +786,14 @@ mod tests {
         });
 
         let mut value = 0;
-        cosync.run_until_stall(&mut value);
+        cosync.run(&mut value);
         assert_eq!(value, 10);
-        cosync.run_until_stall(&mut value);
+        cosync.run(&mut value);
         assert_eq!(value, 20);
     }
 
     #[test]
-    fn run_until_stall_multiple() {
+    fn run_multiple() {
         // notice that value is declared here
         let mut value = (10, 20);
 
@@ -825,15 +831,15 @@ mod tests {
             }
         });
 
-        executor.run_until_stall(&mut value);
+        executor.run(&mut value);
         assert_eq!(value, (30, 20));
 
-        executor.run_until_stall(&mut value);
+        executor.run(&mut value);
         assert_eq!(value, (40, 40));
     }
 
     #[test]
-    fn run_until_stall_concurrent_weird() {
+    fn run_concurrent_weird() {
         // notice that value is declared here
         let mut value = (10, 20, 30);
 
@@ -889,13 +895,13 @@ mod tests {
             }
         });
 
-        executor.run_until_stall(&mut value);
+        executor.run(&mut value);
         assert_eq!(value, (30, 20, 20));
 
-        executor.run_until_stall(&mut value);
+        executor.run(&mut value);
         assert_eq!(value, (40, 40, 30));
 
-        executor.run_until_stall(&mut value);
+        executor.run(&mut value);
         assert_eq!(value, (40, 40, 40));
     }
 
@@ -920,7 +926,7 @@ mod tests {
             });
         });
 
-        executor.run_until_stall(&mut value);
+        executor.run(&mut value);
 
         assert_eq!(value, 30);
     }
@@ -946,7 +952,7 @@ mod tests {
             sleep_ticks(1).await;
         });
 
-        executor.run_until_stall(&mut value);
+        executor.run(&mut value);
 
         assert_eq!(value.one, 10);
         assert_eq!(value.two, 20);
@@ -976,7 +982,7 @@ mod tests {
         // initialized here, after tasks are made
         // (so code is correctly being deferred)
         value = 0;
-        executor.run_until_stall(&mut value);
+        executor.run(&mut value);
         assert_eq!(value, 30);
     }
 
@@ -998,12 +1004,12 @@ mod tests {
         // initialized here, after tasks are made
         // (so code is correctly being deferred)
         value = 0;
-        executor.run_until_stall(&mut value);
+        executor.run(&mut value);
         assert_eq!(value, 10);
 
         // move it somewhere else..
         let mut executor = Box::new(executor);
-        executor.run_until_stall(&mut value);
+        executor.run(&mut value);
 
         assert_eq!(value, 20);
     }
@@ -1101,8 +1107,8 @@ mod tests {
             }
         });
 
-        cosync.run_until_stall(&mut 3);
-        cosync.run_until_stall(&mut "3");
+        cosync.run(&mut 3);
+        cosync.run(&mut "3");
     }
 
     #[test]
@@ -1154,14 +1160,14 @@ mod tests {
 
         let mut value = 0;
 
-        cosync.run_until_stall(&mut value);
+        cosync.run(&mut value);
 
         assert_eq!(value, 1);
 
         let success = cosync.stop_running_task(id);
         assert!(success);
 
-        cosync.run_until_stall(&mut value);
+        cosync.run(&mut value);
 
         // it's still 1 because we cancelled the task which would have otherwise gotten it to 2
         assert_eq!(value, 1);
