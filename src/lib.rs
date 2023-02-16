@@ -1,12 +1,20 @@
 #![doc = include_str!("../README.md")]
 #![deny(rust_2018_idioms)]
 #![deny(missing_docs)]
+#![warn(clippy::dbg_macro)]
+#![cfg_attr(not(test), warn(clippy::print_stdout))]
+#![warn(clippy::missing_errors_doc)]
+#![warn(clippy::missing_panics_doc)]
+#![warn(clippy::todo)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
 // this is vendored code from the `futures-rs` crate, to avoid
 // having a huge dependency when we only need a little bit
 mod futures;
 use crate::futures::{enter::enter, waker_ref, ArcWake, FuturesUnordered};
+
+mod serial;
+pub use serial::SerialCosync;
 
 use std::{
     collections::VecDeque,
@@ -55,9 +63,7 @@ impl<T: 'static + ?Sized> Cosync<T> {
     ///
     /// [is_running]: Self::is_running
     pub fn len(&self) -> usize {
-        let one = self.is_running_any() as usize;
-
-        one + unlock_mutex(&self.queue).incoming.len()
+        self.pool.len() + unlock_mutex(&self.queue).incoming.len()
     }
 
     /// Returns true if no futures are being executed *and* there are no futures in the queue.
@@ -91,9 +97,7 @@ impl<T: 'static + ?Sized> Cosync<T> {
     ///
     /// This returns `true` on success and `false` on failure.
     pub fn unqueue_task(&mut self, task_id: CosyncTaskId) -> bool {
-        let queue_handle = self.create_queue_handle().queue.upgrade().unwrap();
-
-        let incoming = &mut unlock_mutex(&queue_handle).incoming;
+        let incoming = &mut unlock_mutex(&self.queue).incoming;
         let Some(index) = incoming.iter().position(|future_obj| future_obj.1 == task_id) else { return false };
         incoming.remove(index);
 
@@ -145,20 +149,22 @@ impl<T: 'static + ?Sized> Cosync<T> {
         unlock_mutex(&self.queue).incoming.clear();
     }
 
-    /// Adds a new Task to the TaskQueue.
+    /// Adds a new Task into the Pool directly. This does not queue it at all, for the sake of
+    /// saving a mutex unlock call.
     pub fn queue<Task, Out>(&mut self, task: Task) -> CosyncTaskId
     where
         Task: FnOnce(CosyncInput<T>) -> Out + Send + 'static,
         Out: Future<Output = ()> + Send,
     {
-        let queue_handle = self.create_queue_handle();
+        let cosync_input = CosyncInput(self.create_queue_handle());
+        let id = next_cosync_task_id(&self.queue);
+        self.pool.push(create_future_object(task, cosync_input, id));
 
-        // panics: we can unwrap here because know that the cosync exists because we are the cosync.
-        queue_handle.queue(task).unwrap()
+        id
     }
 
     /// Run all tasks in the queue to completion. If a task won't complete, this will infinitely
-    /// retry it. You probably want `run_until_stall`, which returns once a task returns
+    /// retry it. You probably want `run`, which returns once a task returns
     /// `Polling::Pending`.
     ///
     /// ```
@@ -178,43 +184,7 @@ impl<T: 'static + ?Sized> Cosync<T> {
     /// The function will block the calling thread until *all* tasks in the pool
     /// are complete, including any spawned while running existing tasks.
     pub fn run_blocking(&mut self, parameter: &mut T) {
-        // SAFETY: we own this box and make sure it's safe until we drop,
-        // so the pointer is still valid if we have an `&mut self`
-        unsafe {
-            *self.data = Some(parameter as *mut _);
-        }
-
-        let _enter = enter().expect(
-            "cannot execute `LocalPool` executor from within \
-             another executor",
-        );
-
-        CURRENT_THREAD_NOTIFY.with(|thread_notify| {
-            let waker = waker_ref::waker_ref(thread_notify);
-            let mut cx = Context::from_waker(&waker);
-            loop {
-                if let Poll::Ready(t) = self.poll_pool(&mut cx) {
-                    return t;
-                }
-                // Consume the wakeup that occurred while executing `f`, if any.
-                let unparked = thread_notify.unparked.swap(false, Ordering::Acquire);
-                if !unparked {
-                    // No wakeup occurred. It may occur now, right before parking,
-                    // but in that case the token made available by `unpark()`
-                    // is guaranteed to still be available and `park()` is a no-op.
-                    thread::park();
-                    // When the thread is unparked, `unparked` will have been set
-                    // and needs to be unset before the next call to `f` to avoid
-                    // a redundant loop iteration.
-                    thread_notify.unparked.store(false, Ordering::Release);
-                }
-            }
-        });
-
-        // safety: see above
-        unsafe {
-            *self.data = None;
-        }
+        run_blocking(self.data, parameter, |ctx| self.poll_pool(ctx));
     }
 
     /// Runs all tasks in the queue and returns if no more progress can be made
@@ -227,7 +197,7 @@ impl<T: 'static + ?Sized> Cosync<T> {
     /// cosync.queue(move |mut input| async move {
     ///     *input.get() = 10;
     ///     // this will make the executor stall for a call
-    ///     // we call `run_until_stall` an additional time,
+    ///     // we call `run` an additional time,
     ///     // so we'll complete this 1 tick sleep.
     ///     sleep_ticks(1).await;
     ///
@@ -235,9 +205,9 @@ impl<T: 'static + ?Sized> Cosync<T> {
     /// });
     ///
     /// let mut value = 0;
-    /// cosync.run_until_stall(&mut value);
+    /// cosync.run(&mut value);
     /// assert_eq!(value, 10);
-    /// cosync.run_until_stall(&mut value);
+    /// cosync.run(&mut value);
     /// assert_eq!(value, 20);
     /// ```
     ///
@@ -246,57 +216,45 @@ impl<T: 'static + ?Sized> Cosync<T> {
     /// remaining incomplete tasks in the pool can continue with further use of one
     /// of the pool's run or poll methods. While the function is running, all tasks
     /// in the pool will try to make progress.
-    pub fn run_until_stall(&mut self, parameter: &mut T) {
-        // SAFETY: we own this box and make sure it's safe until we drop,
-        // so the pointer is still valid if we have an `&mut self`
-        unsafe {
-            *self.data = Some(parameter as *mut _);
-        }
-
-        let _enter = enter().expect(
-            "cannot execute `LocalPool` executor from within \
-             another executor",
-        );
-
-        let _ = CURRENT_THREAD_NOTIFY.with(|thread_notify| {
-            let waker = waker_ref::waker_ref(thread_notify);
-            let mut cx = Context::from_waker(&waker);
-            self.poll_pool(&mut cx)
-        });
-
-        // SAFETY: same as above, no one has deallocated this box
-        unsafe {
-            *self.data = None;
-        }
+    pub fn run(&mut self, parameter: &mut T) {
+        run(self.data, parameter, |ctx| self.poll_pool(ctx))
     }
 
-    // Make maximal progress on the entire pool of spawned task, returning `Ready`
-    // if the pool is empty and `Pending` if no further progress can be made.
-    fn poll_pool(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        // state for the FuturesUnordered, which will never be used
-        loop {
-            // try to execute the next ready future
-            let ret = Pin::new(&mut self.pool).poll_next(cx);
+    #[deprecated(note = "use `run` instead", since = "0.3.0")]
+    #[doc(hidden)]
+    pub fn run_until_stall(&mut self, parameter: &mut T) {
+        self.run(parameter)
+    }
 
-            // no queued tasks; we may be done
-            match ret {
-                // this means an inner task is pending
-                Poll::Pending => return Poll::Pending,
-                // the pool was empty already, or we just completed that task.
-                Poll::Ready(None) | Poll::Ready(Some(_)) => {
-                    // grab our next task...
-                    if let Some(task) = unlock_mutex(&self.queue).incoming.pop_front() {
-                        self.pool.push(task)
-                    } else {
-                        return Poll::Ready(());
-                    }
-                }
+    fn poll_pool(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        // dump all the tasks in
+        {
+            let mut queue = unlock_mutex(&self.queue);
+            for task in queue.incoming.drain(..) {
+                self.pool.push(task);
+            }
+        }
+
+        self.pool.increment_counter();
+        loop {
+            let pinned_pool = Pin::new(&mut self.pool);
+            let output = pinned_pool.poll_next(cx);
+
+            // do we have new tasks? we can take care of that now too
+            let mut queue = unlock_mutex(&self.queue);
+            if queue.incoming.is_empty() {
+                break output;
+            }
+
+            // if we have new tasks, time to go around the horn again
+            for task in queue.incoming.drain(..) {
+                self.pool.push(task);
             }
         }
     }
 }
 
-impl<T: 'static> Default for Cosync<T> {
+impl<T: ?Sized + 'static> Default for Cosync<T> {
     fn default() -> Self {
         Self::new()
     }
@@ -312,7 +270,6 @@ impl<T: ?Sized> Drop for Cosync<T> {
     }
 }
 
-#[allow(clippy::non_send_fields_in_send_ty)]
 unsafe impl<T: Send + ?Sized> Send for Cosync<T> {}
 unsafe impl<T: Sync + ?Sized> Sync for Cosync<T> {}
 impl<T> Unpin for Cosync<T> {}
@@ -369,27 +326,7 @@ impl<T: 'static + ?Sized> CosyncQueueHandle<T> {
         Task: FnOnce(CosyncInput<T>) -> Out + Send + 'static,
         Out: Future<Output = ()> + Send,
     {
-        self.queue.upgrade().map(|queue| {
-            // force the future to move...
-            let task = task;
-            let sec = CosyncInput(CosyncQueueHandle {
-                heap_ptr: self.heap_ptr,
-                queue: self.queue.clone(),
-            });
-
-            let our_cb = Box::pin(async move {
-                task(sec).await;
-            });
-
-            let mut mutex_lock = unlock_mutex(&queue);
-            let id = CosyncTaskId(mutex_lock.counter);
-            // note: we use a wrapping add here just so we don't panic on release mode for...
-            // absurd numbers of tasks.
-            mutex_lock.counter = mutex_lock.counter.wrapping_add(1);
-            mutex_lock.incoming.push_back(FutureObject(our_cb, id));
-
-            id
-        })
+        self.queue.upgrade().map(|queue| raw_queue(&queue, task, self.heap_ptr))
     }
 
     /// Tries to force unqueueing a task.
@@ -410,6 +347,120 @@ impl<T: 'static + ?Sized> CosyncQueueHandle<T> {
             true
         })
     }
+}
+
+fn run_blocking<T: ?Sized + 'static>(
+    heap_ptr: *mut Option<*mut T>,
+    parameter: &mut T,
+    mut cback: impl FnMut(&mut Context<'_>) -> Poll<()>,
+) {
+    // SAFETY: we own this box and make sure it's safe until we drop,
+    // so the pointer is still valid if we have an `&mut self`
+    unsafe {
+        *heap_ptr = Some(parameter as *mut _);
+    }
+
+    let _enter = enter().expect(
+        "cannot execute `LocalPool` executor from within \
+         another executor",
+    );
+
+    CURRENT_THREAD_NOTIFY.with(|thread_notify| {
+        let waker = waker_ref::waker_ref(thread_notify);
+        let mut cx = Context::from_waker(&waker);
+        loop {
+            if let Poll::Ready(t) = cback(&mut cx) {
+                return t;
+            }
+            // Consume the wakeup that occurred while executing `f`, if any.
+            let unparked = thread_notify.unparked.swap(false, Ordering::Acquire);
+            if !unparked {
+                // No wakeup occurred. It may occur now, right before parking,
+                // but in that case the token made available by `unpark()`
+                // is guaranteed to still be available and `park()` is a no-op.
+                thread::park();
+                // When the thread is unparked, `unparked` will have been set
+                // and needs to be unset before the next call to `f` to avoid
+                // a redundant loop iteration.
+                thread_notify.unparked.store(false, Ordering::Release);
+            }
+        }
+    });
+
+    // safety: see above
+    unsafe {
+        *heap_ptr = None;
+    }
+}
+
+fn run<T: ?Sized>(
+    heap_ptr: *mut Option<*mut T>,
+    parameter: &mut T,
+    mut cback: impl FnMut(&mut Context<'_>) -> Poll<()>,
+) {
+    // SAFETY: we own this box and make sure it's safe until we drop,
+    // so the pointer is still valid if we have an `&mut self`
+    unsafe {
+        *heap_ptr = Some(parameter as *mut _);
+    }
+
+    let _enter = enter().expect(
+        "cannot execute `LocalPool` executor from within \
+         another executor",
+    );
+
+    let _ = CURRENT_THREAD_NOTIFY.with(|thread_notify| {
+        let waker = waker_ref::waker_ref(thread_notify);
+        let mut cx = Context::from_waker(&waker);
+        cback(&mut cx)
+    });
+
+    // SAFETY: same as above, no one has deallocated this box
+    unsafe {
+        *heap_ptr = None;
+    }
+}
+
+fn raw_queue<T, Task, Out>(queue: &Arc<Mutex<IncomingQueue>>, task: Task, heap_ptr: *mut Option<*mut T>) -> CosyncTaskId
+where
+    T: ?Sized + 'static,
+    Task: FnOnce(CosyncInput<T>) -> Out + Send + 'static,
+    Out: Future<Output = ()> + Send,
+{
+    // force the future to move...
+    let cosync_input = CosyncInput(CosyncQueueHandle {
+        heap_ptr,
+        queue: Arc::downgrade(queue),
+    });
+
+    let id = next_cosync_task_id(queue);
+    let future_object = create_future_object(task, cosync_input, id);
+
+    let mut mutex_lock = unlock_mutex(queue);
+    mutex_lock.incoming.push_back(future_object);
+
+    id
+}
+
+fn next_cosync_task_id(m: &Arc<Mutex<IncomingQueue>>) -> CosyncTaskId {
+    let mut lock = unlock_mutex(m);
+    let id = CosyncTaskId(lock.counter);
+    lock.counter = lock.counter.wrapping_add(1);
+
+    id
+}
+
+fn create_future_object<T, Task, Out>(task: Task, cosync_input: CosyncInput<T>, id: CosyncTaskId) -> FutureObject
+where
+    T: ?Sized + 'static,
+    Task: FnOnce(CosyncInput<T>) -> Out + Send + 'static,
+    Out: Future<Output = ()> + Send,
+{
+    let our_cb = Box::pin(async move {
+        task(cosync_input).await;
+    });
+
+    FutureObject(our_cb, id)
 }
 
 // safety:
@@ -438,6 +489,11 @@ pub struct CosyncInput<T: ?Sized>(CosyncQueueHandle<T>);
 
 impl<T: 'static + ?Sized> CosyncInput<T> {
     /// Gets the underlying [CosyncInputGuard].
+    ///
+    /// # Panics
+    ///
+    /// This can panic if you move the `CosyncInput` out of a closure (with, eg an mspc channel). Do
+    /// not do that.
     pub fn get(&mut self) -> CosyncInputGuard<'_, T> {
         // if you find this guard, it means that you somehow moved the `CosyncInput` out of
         // the closure, and then dropped the `Cosync`. Why would you do that? Don't do that.
@@ -514,9 +570,9 @@ impl fmt::Debug for FutureObject {
     }
 }
 
-/// Sleep the `Cosync` for a given number of calls to `run_until_stall`.
+/// Sleep the `Cosync` for a given number of calls to `run`.
 ///
-/// If you run `run_until_stall` once per tick in your main loop, then
+/// If you run `run` once per tick in your main loop, then
 /// this will sleep for that number of ticks.
 pub fn sleep_ticks(ticks: usize) -> SleepForTick {
     SleepForTick::new(ticks)
@@ -647,7 +703,7 @@ mod tests {
         cosync.queue(|_i| async move {
             println!("actual task body!");
         });
-        cosync.run_until_stall(&mut value);
+        cosync.run(&mut value);
     }
 
     #[test]
@@ -669,10 +725,9 @@ mod tests {
 
             // this will make the executor sleep, stall,
             // and exit out of this tick
-            // we call `run_until_stall` an additional time,
+            // we call `run` an additional time,
             // so we'll complete this 1 tick sleep.
-            let sleep = SleepForTick(1);
-            sleep.await;
+            sleep_ticks(1).await;
 
             let input = &mut *input.get();
             assert_eq!(*input, 30);
@@ -682,20 +737,48 @@ mod tests {
         // initialized here, after tasks are made
         // (so code is correctly being deferred)
         value = 10;
-        executor.run_until_stall(&mut value);
+        executor.run(&mut value);
         value = 30;
-        executor.run_until_stall(&mut value);
+        executor.run(&mut value);
         assert_eq!(value, 0);
     }
 
     #[test]
-    fn run_until_stalled_stalls() {
+    #[allow(clippy::needless_late_init)]
+    fn multi_pool_is_parallel() {
+        // notice that value is declared here
+        let mut value;
+
+        let mut executor: Cosync<(i32, i32)> = Cosync::new();
+        executor.queue(move |mut input| async move {
+            let mut input = input.get();
+
+            assert_eq!((*input).0, 10);
+            (*input).0 = 30;
+        });
+
+        executor.queue(move |mut input| async move {
+            let mut input = input.get();
+
+            assert_eq!((*input).1, 20);
+            (*input).1 = 20;
+        });
+
+        // initialized here, after tasks are made
+        // (so code is correctly being deferred)
+        value = (10, 20);
+        executor.run(&mut value);
+        assert_eq!(value, (30, 20));
+    }
+
+    #[test]
+    fn run_stalls() {
         let mut cosync = Cosync::new();
 
         cosync.queue(move |mut input| async move {
             *input.get() = 10;
             // this will make the executor stall for a call
-            // we call `run_until_stall` an additional time,
+            // we call `run` an additional time,
             // so we'll complete this 1 tick sleep.
             sleep_ticks(1).await;
 
@@ -703,34 +786,176 @@ mod tests {
         });
 
         let mut value = 0;
-        cosync.run_until_stall(&mut value);
+        cosync.run(&mut value);
         assert_eq!(value, 10);
-        cosync.run_until_stall(&mut value);
+        cosync.run(&mut value);
         assert_eq!(value, 20);
     }
 
     #[test]
-    #[allow(clippy::needless_late_init)]
-    fn pool_remains_sequential() {
+    fn run_multiple() {
         // notice that value is declared here
-        let mut value;
+        let mut value = (10, 20);
+
+        let mut executor: Cosync<(i32, i32)> = Cosync::new();
+        executor.queue(move |mut input| async move {
+            {
+                let mut input_guard = input.get();
+
+                assert_eq!((*input_guard).0, 10);
+                (*input_guard).0 = 30;
+            }
+
+            sleep_ticks(1).await;
+
+            {
+                let mut input_guard = input.get();
+                (*input_guard).0 = 40;
+            }
+        });
+
+        executor.queue(move |mut input| async move {
+            {
+                let mut input = input.get();
+
+                assert_eq!((*input).1, 20);
+                (*input).1 = 20;
+            }
+
+            sleep_ticks(1).await;
+
+            {
+                let mut input = input.get();
+
+                (*input).1 = 40;
+            }
+        });
+
+        executor.run(&mut value);
+        assert_eq!(value, (30, 20));
+
+        executor.run(&mut value);
+        assert_eq!(value, (40, 40));
+    }
+
+    #[test]
+    fn run_concurrent_weird() {
+        // notice that value is declared here
+        let mut value = (10, 20, 30);
+
+        let mut executor: Cosync<(i32, i32, i32)> = Cosync::new();
+
+        executor.queue(move |mut input| async move {
+            {
+                let mut input = input.get();
+
+                assert_eq!(input.2, 30);
+                input.2 = 20;
+            }
+
+            sleep_ticks(1).await;
+
+            input.get().2 = 30;
+
+            sleep_ticks(1).await;
+
+            input.get().2 = 40;
+        });
+
+        executor.queue(move |mut input| async move {
+            {
+                let mut input_guard = input.get();
+
+                assert_eq!((*input_guard).0, 10);
+                (*input_guard).0 = 30;
+            }
+
+            sleep_ticks(1).await;
+
+            {
+                let mut input_guard = input.get();
+                (*input_guard).0 = 40;
+            }
+        });
+
+        executor.queue(move |mut input| async move {
+            {
+                let mut input = input.get();
+
+                assert_eq!((*input).1, 20);
+                (*input).1 = 20;
+            }
+
+            sleep_ticks(1).await;
+
+            {
+                let mut input = input.get();
+
+                (*input).1 = 40;
+            }
+        });
+
+        executor.run(&mut value);
+        assert_eq!(value, (30, 20, 20));
+
+        executor.run(&mut value);
+        assert_eq!(value, (40, 40, 30));
+
+        executor.run(&mut value);
+        assert_eq!(value, (40, 40, 40));
+    }
+
+    #[test]
+    fn pool_remains_sequential_multi() {
+        let mut value = 0;
 
         let mut executor: Cosync<i32> = Cosync::new();
         executor.queue(move |mut input| async move {
-            println!("starting task 1");
             *input.get() = 10;
 
-            sleep_ticks(100).await;
+            input.queue(|mut input| async move {
+                println!("running this guy!!");
 
-            *input.get() = 20;
+                *input.get() = 20;
+
+                input.queue(|mut input| async move {
+                    println!("running final guy!!");
+
+                    *input.get() = 30;
+                });
+            });
         });
 
+        executor.run(&mut value);
+
+        assert_eq!(value, 30);
+    }
+
+    #[test]
+    fn multi_sequential_on_spawn() {
+        struct TestMe {
+            one: i32,
+            two: i32,
+        }
+
+        let mut value = TestMe { one: 0, two: 0 };
+
+        let mut executor: Cosync<TestMe> = Cosync::new();
         executor.queue(move |mut input| async move {
-            assert_eq!(*input.get(), 20);
+            input.get().one = 10;
+
+            input.queue(|mut input| async move {
+                println!("running?/");
+                input.get().two = 20;
+            });
+
+            sleep_ticks(1).await;
         });
 
-        value = 0;
-        executor.run_until_stall(&mut value);
+        executor.run(&mut value);
+
+        assert_eq!(value.one, 10);
+        assert_eq!(value.two, 20);
     }
 
     #[test]
@@ -741,11 +966,9 @@ mod tests {
 
         let mut executor: Cosync<i32> = Cosync::new();
         executor.queue(move |mut input| async move {
-            println!("starting task 1");
             *input.get() = 10;
 
             input.queue(move |mut input| async move {
-                println!("starting task 3");
                 assert_eq!(*input.get(), 20);
 
                 *input.get() = 30;
@@ -753,14 +976,13 @@ mod tests {
         });
 
         executor.queue(move |mut input| async move {
-            println!("starting task 2");
             *input.get() = 20;
         });
 
         // initialized here, after tasks are made
         // (so code is correctly being deferred)
         value = 0;
-        executor.run_until_stall(&mut value);
+        executor.run(&mut value);
         assert_eq!(value, 30);
     }
 
@@ -772,7 +994,6 @@ mod tests {
 
         let mut executor: Cosync<i32> = Cosync::new();
         executor.queue(move |mut input| async move {
-            println!("starting task 1");
             *input.get() = 10;
 
             sleep_ticks(1).await;
@@ -783,12 +1004,12 @@ mod tests {
         // initialized here, after tasks are made
         // (so code is correctly being deferred)
         value = 0;
-        executor.run_until_stall(&mut value);
+        executor.run(&mut value);
         assert_eq!(value, 10);
 
         // move it somewhere else..
         let mut executor = Box::new(executor);
-        executor.run_until_stall(&mut value);
+        executor.run(&mut value);
 
         assert_eq!(value, 20);
     }
@@ -886,8 +1107,8 @@ mod tests {
             }
         });
 
-        cosync.run_until_stall(&mut 3);
-        cosync.run_until_stall(&mut "3");
+        cosync.run(&mut 3);
+        cosync.run(&mut "3");
     }
 
     #[test]
@@ -926,39 +1147,6 @@ mod tests {
     }
 
     #[test]
-    fn cancelling_a_task() {
-        let mut cosync: Cosync<i32> = Cosync::new();
-
-        cosync.queue(|mut input| async move {
-            *input.get() += 1;
-
-            sleep_ticks(1).await;
-
-            *input.get() += 1;
-        });
-
-        let mut value = 0;
-
-        cosync.run_until_stall(&mut value);
-
-        assert_eq!(value, 1);
-
-        cosync.clear_running();
-
-        cosync.run_until_stall(&mut value);
-
-        // it's still 1 because we cancelled the task which would have otherwise gotten it to 2
-        assert_eq!(value, 1);
-
-        assert!(cosync.is_empty());
-        let id = cosync.queue(|_| async {});
-        assert_eq!(cosync.len(), 1);
-        let success = cosync.unqueue_task(id);
-        assert!(success);
-        assert!(cosync.is_empty());
-    }
-
-    #[test]
     fn stop_a_running_task() {
         let mut cosync: Cosync<i32> = Cosync::new();
 
@@ -972,14 +1160,14 @@ mod tests {
 
         let mut value = 0;
 
-        cosync.run_until_stall(&mut value);
+        cosync.run(&mut value);
 
         assert_eq!(value, 1);
 
         let success = cosync.stop_running_task(id);
         assert!(success);
 
-        cosync.run_until_stall(&mut value);
+        cosync.run(&mut value);
 
         // it's still 1 because we cancelled the task which would have otherwise gotten it to 2
         assert_eq!(value, 1);

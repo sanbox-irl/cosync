@@ -46,7 +46,7 @@ fn main() {
 
     // this is your main loop
     loop {
-        game.cosync.run_until_stall(&mut game.world);
+        game.cosync.run(&mut game.world);
 
         if game.world.cancel_game {
             break;

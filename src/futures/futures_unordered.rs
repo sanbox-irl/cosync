@@ -1,6 +1,5 @@
 use std::{
     cell::UnsafeCell,
-    cmp,
     fmt::{self, Debug},
     future::Future,
     marker::PhantomData,
@@ -9,8 +8,8 @@ use std::{
     ptr,
     sync::{
         atomic::{
-            AtomicBool, AtomicPtr,
-            Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst},
+            AtomicBool, AtomicPtr, AtomicUsize,
+            Ordering::{self, AcqRel, Acquire, Relaxed, Release, SeqCst},
         },
         Arc, Weak,
     },
@@ -19,58 +18,17 @@ use std::{
 
 use super::{atomic_waker::AtomicWaker, Dequeue, Iter, IterMut, IterPinMut, IterPinRef, ReadyToRunQueue, Task};
 
-/// Constant used for a `FuturesUnordered` to determine how many times it is
-/// allowed to poll underlying futures without yielding.
-///
-/// A single call to `poll_next` may potentially do a lot of work before
-/// yielding. This happens in particular if the underlying futures are awoken
-/// frequently but continue to return `Pending`. This is problematic if other
-/// tasks are waiting on the executor, since they do not get to run. This value
-/// caps the number of calls to `poll` on underlying futures a single call to
-/// `poll_next` is allowed to make.
-///
-/// The value itself is chosen somewhat arbitrarily. It needs to be high enough
-/// that amortize wakeup and scheduling costs, but low enough that we do not
-/// starve other tasks for long.
-///
-/// See also https://github.com/rust-lang/futures-rs/issues/2047.
-///
-/// Note that using the length of the `FuturesUnordered` instead of this value
-/// may cause problems if the number of futures is large.
-/// See also https://github.com/rust-lang/futures-rs/pull/2527.
-///
-/// Additionally, polling the same future twice per iteration may cause another
-/// problem. So, when using this value, it is necessary to limit the max value
-/// based on the length of the `FuturesUnordered`.
-/// (e.g., `cmp::min(self.len(), YIELD_EVERY)`)
-/// See also https://github.com/rust-lang/futures-rs/pull/2333.
-const YIELD_EVERY: usize = 32;
-
 /// A set of futures which may complete in any order.
 ///
 /// This structure is optimized to manage a large number of futures.
 /// Futures managed by [`FuturesUnordered`] will only be polled when they
 /// generate wake-up notifications. This reduces the required amount of work
 /// needed to poll large numbers of futures.
-///
-/// [`FuturesUnordered`] can be filled by [`collect`](Iterator::collect)ing an
-/// iterator of futures into a [`FuturesUnordered`], or by
-/// [`push`](FuturesUnordered::push)ing futures onto an existing
-/// [`FuturesUnordered`]. When new futures are added,
-/// [`poll_next`](Stream::poll_next) must be called in order to begin receiving
-/// wake-ups for new futures.
-///
-/// Note that you can create a ready-made [`FuturesUnordered`] via the
-/// [`collect`](Iterator::collect) method, or you can start with an empty set
-/// with the [`FuturesUnordered::new`] constructor.
-///
-/// This type is only available when the `std` or `alloc` feature of this
-/// library is activated, and it is activated by default.
 #[must_use = "streams do nothing unless polled"]
 pub struct FuturesUnordered<Fut> {
     ready_to_run_queue: Arc<ReadyToRunQueue<Fut>>,
     pub(super) head_all: AtomicPtr<Task<Fut>>,
-    is_terminated: AtomicBool,
+    poll_counter: usize,
 }
 
 #[allow(clippy::non_send_fields_in_send_ty)]
@@ -116,7 +74,6 @@ impl<Fut> Unpin for FuturesUnordered<Fut> {}
 // whether the task is currently inserted in the atomic queue. When a wake-up
 // notification is received, the task will only be inserted into the ready to
 // run queue if it isn't inserted already.
-
 impl<Fut> Default for FuturesUnordered<Fut> {
     fn default() -> Self {
         Self::new()
@@ -138,6 +95,7 @@ impl<Fut> FuturesUnordered<Fut> {
             next_ready_to_run: AtomicPtr::new(ptr::null_mut()),
             queued: AtomicBool::new(true),
             ready_to_run_queue: Weak::new(),
+            last_polled: AtomicUsize::new(1),
         });
         let stub_ptr = Arc::as_ptr(&stub);
         let ready_to_run_queue = Arc::new(ReadyToRunQueue {
@@ -150,7 +108,7 @@ impl<Fut> FuturesUnordered<Fut> {
         Self {
             head_all: AtomicPtr::new(ptr::null_mut()),
             ready_to_run_queue,
-            is_terminated: AtomicBool::new(false),
+            poll_counter: 0,
         }
     }
 
@@ -184,11 +142,8 @@ impl<Fut> FuturesUnordered<Fut> {
             next_ready_to_run: AtomicPtr::new(ptr::null_mut()),
             queued: AtomicBool::new(true),
             ready_to_run_queue: Arc::downgrade(&self.ready_to_run_queue),
+            last_polled: AtomicUsize::new(0),
         });
-
-        // Reset the `is_terminated` flag if we've previously marked ourselves
-        // as terminated.
-        self.is_terminated.store(false, Relaxed);
 
         // Right now our task has a strong reference count of 1. We transfer
         // ownership of this reference count to our internal linked list
@@ -409,28 +364,27 @@ impl<Fut> FuturesUnordered<Fut> {
     }
 }
 
-impl<Fut: Future> FuturesUnordered<Fut> {
-    pub fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Fut::Output>> {
-        // See YIELD_EVERY docs　for more.
-        let yield_every = cmp::min(self.len(), YIELD_EVERY);
+impl<Fut: Future<Output = ()>> FuturesUnordered<Fut> {
+    /// Increments the poll counter. Should be called along with `poll_next`!
+    pub fn increment_counter(&mut self) {
+        // add to our counter
+        self.poll_counter += 1;
+    }
 
-        // Keep track of how many child futures we have polled,
-        // in case we want to forcibly yield.
-        let mut polled = 0;
-
+    pub fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         // Ensure `parent` is correctly set.
         self.ready_to_run_queue.waker.register(cx.waker());
+
+        let mut initial_task_id = None;
 
         loop {
             // Safety: &mut self guarantees the mutual exclusion `dequeue`
             // expects
-            let task = match unsafe { self.ready_to_run_queue.dequeue() } {
+            let task_ptr = match unsafe { self.ready_to_run_queue.dequeue() } {
                 Dequeue::Empty => {
                     if self.is_empty() {
-                        // We can only consider ourselves terminated once we
-                        // have yielded a `None`
-                        *self.is_terminated.get_mut() = true;
-                        return Poll::Ready(None);
+                        // this means we're out of tasks
+                        return Poll::Ready(());
                     } else {
                         return Poll::Pending;
                     }
@@ -445,12 +399,12 @@ impl<Fut: Future> FuturesUnordered<Fut> {
                 Dequeue::Data(task) => task,
             };
 
-            debug_assert!(task != self.ready_to_run_queue.stub());
+            debug_assert!(task_ptr != self.ready_to_run_queue.stub());
 
             // Safety:
             // - `task` is a valid pointer.
             // - We are the only thread that accesses the `UnsafeCell` that contains the future
-            let future = match unsafe { &mut *(*task).future.get() } {
+            let future = match unsafe { &mut *(*task_ptr).future.get() } {
                 Some(future) => future,
 
                 // If the future has already gone away then we're just
@@ -464,7 +418,7 @@ impl<Fut: Future> FuturesUnordered<Fut> {
                     // queue.
 
                     // Safety: `task` is a valid pointer
-                    let task = unsafe { Arc::from_raw(task) };
+                    let task = unsafe { Arc::from_raw(task_ptr) };
 
                     // Double check that the call to `release_task` really
                     // happened. Calling it required the task to be unlinked.
@@ -477,13 +431,36 @@ impl<Fut: Future> FuturesUnordered<Fut> {
             };
 
             // Safety: `task` is a valid pointer
-            let task = unsafe { self.unlink(task) };
+            let task = unsafe { self.unlink(task_ptr) };
 
             // Unset queued flag: This must be done before polling to ensure
             // that the future's task gets rescheduled if it sends a wake-up
             // notification **during** the call to `poll`.
             let prev = task.queued.swap(false, SeqCst);
             assert!(prev);
+
+            if task.last_polled.load(Ordering::Relaxed) >= self.poll_counter {
+                // we put it back to true -- this is because we want to make sure to use the flag to find errors.
+                task.queued.swap(true, SeqCst);
+
+                let task_ptr = self.link(task);
+                self.ready_to_run_queue.enqueue(task_ptr);
+
+                match initial_task_id {
+                    Some(iti) => {
+                        if iti == task_ptr as usize {
+                            return Poll::Pending;
+                        } else {
+                            continue;
+                        }
+                    }
+                    None => {
+                        initial_task_id = Some(task_ptr as usize);
+                        continue;
+                    }
+                }
+            }
+            task.last_polled.store(self.poll_counter, Ordering::Relaxed);
 
             // We're going to need to be very careful if the `poll`
             // method below panics. We need to (a) not leak memory and
@@ -531,27 +508,22 @@ impl<Fut: Future> FuturesUnordered<Fut> {
 
                 // Safety: We won't move the future ever again
                 let future = unsafe { Pin::new_unchecked(future) };
-
                 future.poll(&mut cx)
             };
-            polled += 1;
 
             match res {
                 Poll::Pending => {
+                    // change the ordering so we don't see it again this cycle...
                     let task = bomb.task.take().unwrap();
-                    bomb.queue.link(task);
+                    let task_ptr = bomb.queue.link(task);
 
-                    if polled == yield_every {
-                        // We have polled a large number of futures in a row without yielding.
-                        // To ensure we do not starve other tasks waiting on the executor,
-                        // we yield here, but immediately wake ourselves up to continue.
-                        cx.waker().wake_by_ref();
-                        return Poll::Pending;
+                    // we're using pointers as usize because we live dangerously
+                    if initial_task_id.is_none() {
+                        initial_task_id = Some(task_ptr as usize);
                     }
-                    continue;
                 }
-                Poll::Ready(output) => return Poll::Ready(Some(output)),
-            }
+                Poll::Ready(()) => {}
+            };
         }
     }
 }
@@ -570,8 +542,6 @@ impl<Fut> FuturesUnordered<Fut> {
 
         // we just cleared all the tasks, and we have &mut self, so this is safe.
         unsafe { self.ready_to_run_queue.clear() };
-
-        self.is_terminated.store(false, Relaxed);
     }
 
     fn clear_head_all(&mut self) {

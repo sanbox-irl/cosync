@@ -1,8 +1,5 @@
-use super::task::Task;
-use super::FuturesUnordered;
-use core::marker::PhantomData;
-use core::pin::Pin;
-use core::sync::atomic::Ordering::Relaxed;
+use super::{task::Task, FuturesUnordered};
+use core::{marker::PhantomData, pin::Pin, sync::atomic::Ordering::Relaxed};
 
 /// Mutable iterator over all futures in the unordered set.
 #[derive(Debug)]
