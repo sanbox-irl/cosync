@@ -8,7 +8,7 @@ use std::{
     ptr,
     sync::{
         atomic::{
-            AtomicBool, AtomicPtr, AtomicUsize,
+            AtomicBool, AtomicPtr, AtomicU64,
             Ordering::{self, AcqRel, Acquire, Relaxed, Release, SeqCst},
         },
         Arc, Weak,
@@ -28,7 +28,7 @@ use super::{atomic_waker::AtomicWaker, Dequeue, Iter, IterMut, IterPinMut, IterP
 pub struct FuturesUnordered<Fut> {
     ready_to_run_queue: Arc<ReadyToRunQueue<Fut>>,
     pub(super) head_all: AtomicPtr<Task<Fut>>,
-    poll_counter: usize,
+    poll_counter: u64,
 }
 
 #[allow(clippy::non_send_fields_in_send_ty)]
@@ -95,7 +95,7 @@ impl<Fut> FuturesUnordered<Fut> {
             next_ready_to_run: AtomicPtr::new(ptr::null_mut()),
             queued: AtomicBool::new(true),
             ready_to_run_queue: Weak::new(),
-            last_polled: AtomicUsize::new(1),
+            last_polled: AtomicU64::new(1),
         });
         let stub_ptr = Arc::as_ptr(&stub);
         let ready_to_run_queue = Arc::new(ReadyToRunQueue {
@@ -142,7 +142,7 @@ impl<Fut> FuturesUnordered<Fut> {
             next_ready_to_run: AtomicPtr::new(ptr::null_mut()),
             queued: AtomicBool::new(true),
             ready_to_run_queue: Arc::downgrade(&self.ready_to_run_queue),
-            last_polled: AtomicUsize::new(0),
+            last_polled: AtomicU64::new(0),
         });
 
         // Right now our task has a strong reference count of 1. We transfer
@@ -366,9 +366,10 @@ impl<Fut> FuturesUnordered<Fut> {
 
 impl<Fut: Future<Output = ()>> FuturesUnordered<Fut> {
     /// Increments the poll counter. Should be called along with `poll_next`!
-    pub fn increment_counter(&mut self) {
+    pub fn increment_counter(&mut self) -> u64 {
         // add to our counter
         self.poll_counter += 1;
+        self.poll_counter
     }
 
     pub fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {

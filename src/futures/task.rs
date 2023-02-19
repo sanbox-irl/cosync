@@ -4,7 +4,7 @@ use std::{
     cell::UnsafeCell,
     sync::{
         atomic::{
-            AtomicBool, AtomicPtr, AtomicUsize,
+            AtomicBool, AtomicPtr, AtomicU64,
             Ordering::{self, SeqCst},
         },
         Arc, Weak,
@@ -37,7 +37,7 @@ pub(super) struct Task<Fut> {
     pub(super) queued: AtomicBool,
 
     // Checks if it was polled each poll cycle.
-    pub(super) last_polled: AtomicUsize,
+    pub(super) last_polled: AtomicU64,
 }
 
 // `Task` can be sent across threads safely because it ensures that
