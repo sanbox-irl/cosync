@@ -191,22 +191,24 @@ impl<T: 'static + ?Sized> Cosync<T> {
     /// on any task.
     ///
     /// ```
-    /// use cosync::{sleep_ticks, Cosync};
+    /// use cosync::{yield_now, Cosync};
     ///
     /// let mut cosync = Cosync::new();
     /// cosync.queue(move |mut input| async move {
     ///     *input.get() = 10;
     ///     // this will make the executor stall for a call
-    ///     // we call `run` an additional time,
-    ///     // so we'll complete this 1 tick sleep.
-    ///     sleep_ticks(1).await;
+    ///     yield_now().await;
     ///
     ///     *input.get() = 20;
     /// });
     ///
     /// let mut value = 0;
+    /// 
+    /// // this will run until the `.await`
     /// cosync.run(&mut value);
     /// assert_eq!(value, 10);
+    ///
+    /// // we call `run` an additional time
     /// cosync.run(&mut value);
     /// assert_eq!(value, 20);
     /// ```
@@ -580,6 +582,7 @@ pub fn sleep_ticks(ticks: usize) -> SleepForTick {
 }
 
 /// A helper struct which registers a sleep for a given number of ticks.
+#[must_use = "futures do nothing unless you `.await` or poll them"]
 #[derive(Clone, Copy, Debug)]
 #[doc(hidden)] // so users only see `sleep_ticks` above.
 pub struct SleepForTick(pub usize);
@@ -610,7 +613,7 @@ impl Future for SleepForTick {
 }
 
 /// Immediately yields control back, returning a `Pending`. The next time the future is
-/// polled, it will continue. This is semantically equivalent to `sleep_ticks(1)`, but more
+/// polled, it will continue. This is semantically equivalent to `yield_now()`, but more
 /// performant.
 #[inline]
 pub fn yield_now() -> Yield {
@@ -618,6 +621,7 @@ pub fn yield_now() -> Yield {
 }
 
 /// Helper struct for yielding for a tick.
+#[must_use = "futures do nothing unless you `.await` or poll them"]
 #[derive(Clone, Copy, Debug)]
 #[doc(hidden)] // so users only see `yield_now`
 pub struct Yield(bool);
@@ -754,7 +758,7 @@ mod tests {
             // and exit out of this tick
             // we call `run` an additional time,
             // so we'll complete this 1 tick sleep.
-            sleep_ticks(1).await;
+            yield_now().await;
 
             let input = &mut *input.get();
             assert_eq!(*input, 30);
@@ -807,7 +811,7 @@ mod tests {
             // this will make the executor stall for a call
             // we call `run` an additional time,
             // so we'll complete this 1 tick sleep.
-            sleep_ticks(1).await;
+            yield_now().await;
 
             *input.get() = 20;
         });
@@ -833,7 +837,7 @@ mod tests {
                 (*input_guard).0 = 30;
             }
 
-            sleep_ticks(1).await;
+            yield_now().await;
 
             {
                 let mut input_guard = input.get();
@@ -849,7 +853,7 @@ mod tests {
                 (*input).1 = 20;
             }
 
-            sleep_ticks(1).await;
+            yield_now().await;
 
             {
                 let mut input = input.get();
@@ -880,11 +884,11 @@ mod tests {
                 input.2 = 20;
             }
 
-            sleep_ticks(1).await;
+            yield_now().await;
 
             input.get().2 = 30;
 
-            sleep_ticks(1).await;
+            yield_now().await;
 
             input.get().2 = 40;
         });
@@ -897,7 +901,7 @@ mod tests {
                 (*input_guard).0 = 30;
             }
 
-            sleep_ticks(1).await;
+            yield_now().await;
 
             {
                 let mut input_guard = input.get();
@@ -913,7 +917,7 @@ mod tests {
                 (*input).1 = 20;
             }
 
-            sleep_ticks(1).await;
+            yield_now().await;
 
             {
                 let mut input = input.get();
@@ -976,7 +980,7 @@ mod tests {
                 input.get().two = 20;
             });
 
-            sleep_ticks(1).await;
+            yield_now().await;
         });
 
         executor.run(&mut value);
@@ -1023,7 +1027,7 @@ mod tests {
         executor.queue(move |mut input| async move {
             *input.get() = 10;
 
-            sleep_ticks(1).await;
+            yield_now().await;
 
             *input.get() = 20;
         });
@@ -1069,7 +1073,7 @@ mod tests {
 
         executor.queue(move |input| async move {
             let sndr: std::sync::mpsc::Sender<_> = sndr;
-            sleep_ticks(1).await;
+            yield_now().await;
             sndr.send(input).unwrap();
         });
 
@@ -1126,7 +1130,7 @@ mod tests {
                 assert_eq!(inner.test(), 3);
             }
 
-            sleep_ticks(1).await;
+            yield_now().await;
 
             {
                 let inner: &mut dyn DynDispatch = &mut *input.get();
@@ -1180,7 +1184,7 @@ mod tests {
         let id = cosync.queue(|mut input| async move {
             *input.get() += 1;
 
-            sleep_ticks(1).await;
+            yield_now().await;
 
             *input.get() += 1;
         });
@@ -1198,5 +1202,23 @@ mod tests {
 
         // it's still 1 because we cancelled the task which would have otherwise gotten it to 2
         assert_eq!(value, 1);
+    }
+
+    #[test]
+    fn sleep_ticker() {
+        let mut cosync: Cosync<i32> = Cosync::new();
+
+        let mut value = 0;
+        cosync.queue(|mut input| async move {
+            sleep_ticks(5).await;
+            *input.get() = 10;
+        });
+
+        for _ in 0..5 {
+            cosync.run(&mut value);
+            assert_eq!(value, 0);
+        }
+        cosync.run(&mut value);
+        assert_eq!(value, 10);
     }
 }

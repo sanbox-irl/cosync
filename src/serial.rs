@@ -156,7 +156,7 @@ impl<T: ?Sized + 'static> Default for SerialCosync<T> {
 
 #[cfg(test)]
 mod tests {
-    use crate::sleep_ticks;
+    use crate::{sleep_ticks, yield_now};
 
     use super::*;
 
@@ -190,7 +190,7 @@ mod tests {
         cosync.queue(|mut input| async move {
             *input.get() += 1;
 
-            sleep_ticks(1).await;
+            yield_now().await;
 
             *input.get() += 1;
         });
