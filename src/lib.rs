@@ -575,14 +575,14 @@ impl fmt::Debug for FutureObject {
 /// If you run `run` once per tick in your main loop, then
 /// this will sleep for that number of ticks.
 #[inline]
-pub async fn sleep_ticks(ticks: usize) {
-    SleepForTick::new(ticks).await;
+pub fn sleep_ticks(ticks: usize) -> SleepForTick {
+    SleepForTick::new(ticks)
 }
 
 /// A helper struct which registers a sleep for a given number of ticks.
 #[derive(Clone, Copy, Debug)]
 #[doc(hidden)] // so users only see `sleep_ticks` above.
-struct SleepForTick(pub usize);
+pub struct SleepForTick(pub usize);
 
 impl SleepForTick {
     /// Sleep for the number of ticks provided.
@@ -613,12 +613,14 @@ impl Future for SleepForTick {
 /// polled, it will continue. This is semantically equivalent to `sleep_ticks(1)`, but more
 /// performant.
 #[inline]
-pub async fn yield_now() {
-    Yield(false).await;
+pub fn yield_now() -> Yield {
+    Yield(false)
 }
 
+/// Helper struct for yielding for a tick.
 #[derive(Clone, Copy, Debug)]
-struct Yield(bool);
+#[doc(hidden)] // so users only see `yield_now`
+pub struct Yield(bool);
 
 impl Future for Yield {
     type Output = ();
@@ -652,18 +654,18 @@ impl Future for Yield {
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(transparent)]
-pub struct CosyncTaskId(usize);
+pub struct CosyncTaskId(u64);
 
 impl CosyncTaskId {
     /// Creates a CosyncTaskId set to `usize::MAX`. Theoretically, this could refer to a valid task
     /// but would be exceedingly unlikely.
-    pub const DANGLING: CosyncTaskId = CosyncTaskId(usize::MAX);
+    pub const DANGLING: CosyncTaskId = CosyncTaskId(u64::MAX);
 }
 
 #[derive(Debug, Default)]
 struct IncomingQueue {
     incoming: VecDeque<FutureObject>,
-    counter: usize,
+    counter: u64,
 }
 
 struct ThreadNotify {
