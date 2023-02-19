@@ -7,6 +7,7 @@ struct Game {
 
 struct World {
     player_position: f32,
+    monster_position: f32,
     /// you'll use this in game to queue tasks, assuming you don't want to pass around `Game` and
     /// just pass around `World`. You can also use this in `cosync.queue` to queue stuff, but this
     /// is fine too.
@@ -18,6 +19,7 @@ fn main() {
     let cosync = Cosync::new();
     let world = World {
         player_position: 0.0,
+        monster_position: 20.0,
         cosync_handle: cosync.create_queue_handle(),
         cancel_game: false,
     };
@@ -34,18 +36,24 @@ fn main() {
         .queue(move |mut world| async move {
             // get sleepy!
             cosync::sleep_ticks(10).await;
-            let mut world = world.get();
-            world.player_position = pos;
+            world.get().player_position = pos;
         })
         .unwrap(); // you don't really need to unwrap here -- this only is `None` is `Cosync` was dropped, which is rare.
 
     game.cosync.queue(move |mut world| async move {
-        let mut world = world.get();
-        world.cancel_game = true;
+        world.get().monster_position = pos;
+
+        // it takes 100 ticks to defeat the monster
+        cosync::sleep_ticks(100).await;
+
+        world.get().cancel_game = true;
     });
 
     // this is your main loop
     loop {
+        // note that both of our tasks are actually running at the same time.
+        // since the monster task takes 100 ticks to complete, it will complete later than
+        // the first task.
         game.cosync.run(&mut game.world);
 
         if game.world.cancel_game {
@@ -54,4 +62,5 @@ fn main() {
     }
 
     assert_eq!(game.world.player_position, 2.0);
+    assert_eq!(game.world.monster_position, 2.0);
 }
