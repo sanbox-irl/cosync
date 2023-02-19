@@ -203,7 +203,7 @@ impl<T: 'static + ?Sized> Cosync<T> {
     /// });
     ///
     /// let mut value = 0;
-    /// 
+    ///
     /// // this will run until the `.await`
     /// cosync.run(&mut value);
     /// assert_eq!(value, 10);
