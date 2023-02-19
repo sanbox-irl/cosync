@@ -574,15 +574,15 @@ impl fmt::Debug for FutureObject {
 ///
 /// If you run `run` once per tick in your main loop, then
 /// this will sleep for that number of ticks.
-pub fn sleep_ticks(ticks: usize) -> SleepForTick {
-    SleepForTick::new(ticks)
+#[inline]
+pub async fn sleep_ticks(ticks: usize) {
+    SleepForTick::new(ticks).await;
 }
 
 /// A helper struct which registers a sleep for a given number of ticks.
-#[must_use = "futures do nothing unless you `.await` or poll them"]
 #[derive(Clone, Copy, Debug)]
 #[doc(hidden)] // so users only see `sleep_ticks` above.
-pub struct SleepForTick(pub usize);
+struct SleepForTick(pub usize);
 
 impl SleepForTick {
     /// Sleep for the number of ticks provided.
@@ -605,6 +605,31 @@ impl Future for SleepForTick {
             cx.waker().wake_by_ref();
 
             Poll::Pending
+        }
+    }
+}
+
+/// Immediately yields control back, returning a `Pending`. The next time the future is
+/// polled, it will continue. This is semantically equivalent to `sleep_ticks(1)`, but more
+/// performant.
+#[inline]
+pub async fn yield_now() {
+    Yield(false).await;
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Yield(bool);
+
+impl Future for Yield {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if !self.0 {
+            self.0 = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        } else {
+            Poll::Ready(())
         }
     }
 }
