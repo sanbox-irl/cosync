@@ -5,7 +5,7 @@
 - BREAKING: this library used to use `parking_lot` internally. Now by default we only use the `std`, but have added a feature flag for `parking_lot`.
 - BREAKING: `is_executing` has been renamed `is_running`. It now takes a parameter. Use `is_running_any` for previous behavior.
 - BREAKING: `SleepForTick` has been made private, and now can only be accessed via `sleep_for_tick`. Since `SleepForTick` was `[doc(hidden)]`, this should not break most code.
-- BREAKING: `run_until_stall` has been renamed to `run` to denote its primacy.
+- DEPRECATED: `run_until_stall` has been renamed to `run` to denote its primacy. The old method name has been marked as deprecated.
 - Added: `queue`ing a task returns a `CosyncTaskId`. This can be used in `unqueue_task`, `stop_running_task`, and for comparison operations between task ids.
 - Added: an example for how to use Cosync.
 - Removed: `CosyncWasDropped` was declared, but not used. This is a breaking change, but would be bizarre if a user relied on it.
