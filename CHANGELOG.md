@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.3.0] - 2025-03-13
 
 - BREAKING: this library used to use `parking_lot` internally. Now by default we only use the `std`, but have added a feature flag for `parking_lot`.
 - BREAKING: `is_executing` has been renamed `is_running`. It now takes a parameter. Use `is_running_any` for previous behavior.
