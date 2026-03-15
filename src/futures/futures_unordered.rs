@@ -7,16 +7,16 @@ use std::{
     pin::Pin,
     ptr,
     sync::{
+        Arc, Weak,
         atomic::{
             AtomicBool, AtomicPtr, AtomicU64,
             Ordering::{self, AcqRel, Acquire, Relaxed, Release, SeqCst},
         },
-        Arc, Weak,
     },
     task::{Context, Poll},
 };
 
-use super::{atomic_waker::AtomicWaker, Dequeue, Iter, IterMut, IterPinMut, IterPinRef, ReadyToRunQueue, Task};
+use super::{Dequeue, Iter, IterMut, IterPinMut, IterPinRef, ReadyToRunQueue, Task, atomic_waker::AtomicWaker};
 
 /// A set of futures which may complete in any order.
 ///
@@ -307,31 +307,34 @@ impl<Fut> FuturesUnordered<Fut> {
         // and won't be able to retrieve the correct length later.
         let head = *self.head_all.get_mut();
         debug_assert!(!head.is_null());
-        let new_len = *(*head).len_all.get() - 1;
 
-        let task = Arc::from_raw(task);
-        let next = task.next_all.load(Relaxed);
-        let prev = *task.prev_all.get();
-        task.next_all.store(self.pending_next_all(), Relaxed);
-        *task.prev_all.get() = ptr::null_mut();
+        unsafe {
+            let new_len = *(*head).len_all.get() - 1;
 
-        if !next.is_null() {
-            *(*next).prev_all.get() = prev;
+            let task = Arc::from_raw(task);
+            let next = task.next_all.load(Relaxed);
+            let prev = *task.prev_all.get();
+            task.next_all.store(self.pending_next_all(), Relaxed);
+            *task.prev_all.get() = ptr::null_mut();
+
+            if !next.is_null() {
+                *(*next).prev_all.get() = prev;
+            }
+
+            if !prev.is_null() {
+                (*prev).next_all.store(next, Relaxed);
+            } else {
+                *self.head_all.get_mut() = next;
+            }
+
+            // Store the new list length in the head node.
+            let head = *self.head_all.get_mut();
+            if !head.is_null() {
+                *(*head).len_all.get() = new_len;
+            }
+
+            task
         }
-
-        if !prev.is_null() {
-            (*prev).next_all.store(next, Relaxed);
-        } else {
-            *self.head_all.get_mut() = next;
-        }
-
-        // Store the new list length in the head node.
-        let head = *self.head_all.get_mut();
-        if !head.is_null() {
-            *(*head).len_all.get() = new_len;
-        }
-
-        task
     }
 
     /// Returns the reserved value for `Task::next_all` to indicate a pending

@@ -1,6 +1,8 @@
 use std::{cell::Cell, fmt};
 
-thread_local!(static ENTERED: Cell<bool> = Cell::new(false));
+thread_local!(
+    static ENTERED: Cell<bool> = const { Cell::new(false) }
+);
 
 /// Represents an executor context.
 ///

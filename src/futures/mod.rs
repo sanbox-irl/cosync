@@ -65,7 +65,7 @@ mod atomic_waker;
 mod iter;
 
 // mod iter;
-pub use self::iter::{IntoIter, Iter, IterMut, IterPinMut, IterPinRef};
+pub use self::iter::{Iter, IterMut, IterPinMut, IterPinRef};
 use std::sync::Arc;
 
 mod futures_unordered;

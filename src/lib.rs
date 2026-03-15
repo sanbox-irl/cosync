@@ -512,6 +512,11 @@ impl<T: 'static + ?Sized> CosyncInput<T> {
     }
 
     /// Queues a new task. This goes to the back of queue.
+    /// 
+    /// ## Panics
+    /// 
+    /// It is possible for this function to panic if the [`CosyncInput`] was somehow moved
+    /// out of the closure it was created it. This should not be possible.
     pub fn queue<Task, Out>(&self, task: Task) -> CosyncTaskId
     where
         Task: FnOnce(CosyncInput<T>) -> Out + Send + 'static,

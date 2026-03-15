@@ -1,4 +1,4 @@
-use super::{task::Task, FuturesUnordered};
+use super::{FuturesUnordered, task::Task};
 use core::{marker::PhantomData, pin::Pin, sync::atomic::Ordering::Relaxed};
 
 /// Mutable iterator over all futures in the unordered set.
@@ -25,47 +25,6 @@ pub struct IterPinRef<'a, Fut> {
 /// Immutable iterator over all the futures in the unordered set.
 #[derive(Debug)]
 pub struct Iter<'a, Fut: Unpin>(pub(super) IterPinRef<'a, Fut>);
-
-/// Owned iterator over all futures in the unordered set.
-#[derive(Debug)]
-pub struct IntoIter<Fut: Unpin> {
-    pub(super) len: usize,
-    pub(super) inner: FuturesUnordered<Fut>,
-}
-
-impl<Fut: Unpin> Iterator for IntoIter<Fut> {
-    type Item = Fut;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        // `head_all` can be accessed directly and we don't need to spin on
-        // `Task::next_all` since we have exclusive access to the set.
-        let task = self.inner.head_all.get_mut();
-
-        if (*task).is_null() {
-            return None;
-        }
-
-        unsafe {
-            // Moving out of the future is safe because it is `Unpin`
-            let future = (*(**task).future.get()).take().unwrap();
-
-            // Mutable access to a previously shared `FuturesUnordered` implies
-            // that the other threads already released the object before the
-            // current thread acquired it, so relaxed ordering can be used and
-            // valid `next_all` checks can be skipped.
-            let next = (**task).next_all.load(Relaxed);
-            *task = next;
-            self.len -= 1;
-            Some(future)
-        }
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.len, Some(self.len))
-    }
-}
-
-impl<Fut: Unpin> ExactSizeIterator for IntoIter<Fut> {}
 
 impl<'a, Fut> Iterator for IterPinMut<'a, Fut> {
     type Item = Pin<&'a mut Fut>;
@@ -160,6 +119,3 @@ unsafe impl<Fut: Sync> Sync for IterPinRef<'_, Fut> {}
 
 unsafe impl<Fut: Send> Send for IterPinMut<'_, Fut> {}
 unsafe impl<Fut: Sync> Sync for IterPinMut<'_, Fut> {}
-
-unsafe impl<Fut: Send + Unpin> Send for IntoIter<Fut> {}
-unsafe impl<Fut: Sync + Unpin> Sync for IntoIter<Fut> {}

@@ -62,30 +62,38 @@ pub fn waker_vtable<T: ArcWake>() -> &'static RawWakerVTable {
 
 #[allow(clippy::redundant_clone)] // The clone here isn't actually redundant.
 unsafe fn increase_refcount<T>(data: *const ()) {
-    // Retain Arc, but don't touch refcount by wrapping in ManuallyDrop
-    let arc = ManuallyDrop::new(Arc::<T>::from_raw(data as *const T));
-    // Now increase refcount, but don't drop new refcount either
-    let _arc_clone: ManuallyDrop<_> = arc.clone();
+    unsafe {
+        // Retain Arc, but don't touch refcount by wrapping in ManuallyDrop
+        let arc = ManuallyDrop::new(Arc::<T>::from_raw(data as *const T));
+        // Now increase refcount, but don't drop new refcount either
+        let _arc_clone: ManuallyDrop<_> = arc.clone();
+    }
 }
 
 // used by `waker_ref`
 unsafe fn clone_arc_raw<T: ArcWake>(data: *const ()) -> RawWaker {
-    increase_refcount::<T>(data);
+    unsafe {
+        increase_refcount::<T>(data);
+    }
     RawWaker::new(data, waker_vtable::<T>())
 }
 
 unsafe fn wake_arc_raw<T: ArcWake>(data: *const ()) {
-    let arc: Arc<T> = Arc::from_raw(data as *const T);
-    ArcWake::wake(arc);
+    unsafe {
+        let arc: Arc<T> = Arc::from_raw(data as *const T);
+        ArcWake::wake(arc);
+    }
 }
 
 // used by `waker_ref`
 unsafe fn wake_by_ref_arc_raw<T: ArcWake>(data: *const ()) {
-    // Retain Arc, but don't touch refcount by wrapping in ManuallyDrop
-    let arc = ManuallyDrop::new(Arc::<T>::from_raw(data as *const T));
-    ArcWake::wake_by_ref(&arc)
+    unsafe {
+        // Retain Arc, but don't touch refcount by wrapping in ManuallyDrop
+        let arc = ManuallyDrop::new(Arc::<T>::from_raw(data as *const T));
+        ArcWake::wake_by_ref(&arc)
+    }
 }
 
 unsafe fn drop_arc_raw<T>(data: *const ()) {
-    drop(Arc::<T>::from_raw(data as *const T))
+    unsafe { drop(Arc::<T>::from_raw(data as *const T)) }
 }
