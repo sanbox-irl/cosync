@@ -126,12 +126,12 @@ pub struct AtomicWaker {
 //
 // Because of this, the waker will do one of two things.
 //
-// 1) Observe the application state change that Thread B is woken for. In this
-//    case, it is OK for Thread B's wake to be lost.
+// 1) Observe the application state change that Thread B is woken for. In this case, it is OK for
+//    Thread B's wake to be lost.
 //
-// 2) Call register before attempting to observe the application state. Since
-//    Thread A still holds the `wake` lock, the call to `register` will result
-//    in the task waking itself and get scheduled again.
+// 2) Call register before attempting to observe the application state. Since Thread A still holds
+//    the `wake` lock, the call to `register` will result in the task waking itself and get
+//    scheduled again.
 
 /// Idle state
 const WAITING: usize = 0;

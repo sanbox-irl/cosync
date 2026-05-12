@@ -1,13 +1,13 @@
-use super::{abort, waker_ref::WakerRef, ArcWake, ReadyToRunQueue};
+use super::{ArcWake, ReadyToRunQueue, abort, waker_ref::WakerRef};
 // use futures::task::{waker_ref, ArcWake, WakerRef};
 use std::{
     cell::UnsafeCell,
     sync::{
+        Arc, Weak,
         atomic::{
             AtomicBool, AtomicPtr, AtomicU64,
             Ordering::{self, SeqCst},
         },
-        Arc, Weak,
     },
 };
 

@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::{
-    create_future_object, next_cosync_task_id, unlock_mutex, Cosync, CosyncInput, CosyncQueueHandle, CosyncTaskId,
+    Cosync, CosyncInput, CosyncQueueHandle, CosyncTaskId, create_future_object, next_cosync_task_id, unlock_mutex,
 };
 
 /// A `SerialCosync` has the same API as `Cosync`, but *only* runs one task at a time,
@@ -56,7 +56,9 @@ impl<T: ?Sized + 'static> SerialCosync<T> {
     /// This returns `true` on success and `false` on failure.
     pub fn unqueue_task(&mut self, task_id: CosyncTaskId) -> bool {
         let incoming = &mut unlock_mutex(&self.0.queue).incoming;
-        let Some(index) = incoming.iter().position(|future_obj| future_obj.1 == task_id) else { return false };
+        let Some(index) = incoming.iter().position(|future_obj| future_obj.1 == task_id) else {
+            return false;
+        };
         incoming.remove(index);
 
         true

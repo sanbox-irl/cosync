@@ -11,7 +11,7 @@
 // this is vendored code from the `futures-rs` crate, to avoid
 // having a huge dependency when we only need a little bit
 mod futures;
-use crate::futures::{enter::enter, waker_ref, ArcWake, FuturesUnordered};
+use crate::futures::{ArcWake, FuturesUnordered, enter::enter, waker_ref};
 
 mod serial;
 pub use serial::SerialCosync;
@@ -24,8 +24,8 @@ use std::{
     ops,
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, Weak,
+        atomic::{AtomicBool, Ordering},
     },
     task::{Context, Poll},
     thread::{self, Thread},
@@ -98,7 +98,9 @@ impl<T: 'static + ?Sized> Cosync<T> {
     /// This returns `true` on success and `false` on failure.
     pub fn unqueue_task(&mut self, task_id: CosyncTaskId) -> bool {
         let incoming = &mut unlock_mutex(&self.queue).incoming;
-        let Some(index) = incoming.iter().position(|future_obj| future_obj.1 == task_id) else { return false };
+        let Some(index) = incoming.iter().position(|future_obj| future_obj.1 == task_id) else {
+            return false;
+        };
         incoming.remove(index);
 
         true
@@ -191,7 +193,7 @@ impl<T: 'static + ?Sized> Cosync<T> {
     /// on any task.
     ///
     /// ```
-    /// use cosync::{yield_now, Cosync};
+    /// use cosync::{Cosync, yield_now};
     ///
     /// let mut cosync = Cosync::new();
     /// cosync.queue(move |mut input| async move {
@@ -343,7 +345,9 @@ impl<T: 'static + ?Sized> CosyncQueueHandle<T> {
     pub fn unqueue_task(&mut self, task_id: CosyncTaskId) -> Option<bool> {
         self.queue.upgrade().map(|queue_handle| {
             let incoming = &mut unlock_mutex(&queue_handle).incoming;
-            let Some(index) = incoming.iter().position(|future_obj| future_obj.1 == task_id) else { return false };
+            let Some(index) = incoming.iter().position(|future_obj| future_obj.1 == task_id) else {
+                return false;
+            };
             incoming.remove(index);
 
             true
@@ -512,9 +516,9 @@ impl<T: 'static + ?Sized> CosyncInput<T> {
     }
 
     /// Queues a new task. This goes to the back of queue.
-    /// 
+    ///
     /// ## Panics
-    /// 
+    ///
     /// It is possible for this function to panic if the [`CosyncInput`] was somehow moved
     /// out of the closure it was created it. This should not be possible.
     pub fn queue<Task, Out>(&self, task: Task) -> CosyncTaskId
